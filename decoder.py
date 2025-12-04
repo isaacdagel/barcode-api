@@ -33,11 +33,10 @@ from PIL import Image
 # ----------------- tunable constants -----------------
 
 # Vertical band (fraction of full height) where the barcode lives.
-# Based on sample images (~0.28–0.32), this brackets that region.
 BAND_Y0_FRAC = 0.22
 BAND_Y1_FRAC = 0.36
 
-# Minimum length we consider a “real” barcode.
+# Minimum length we consider a “real” barcode (ignore junk like "1").
 MIN_BARCODE_LEN = 8
 
 # Target minimum ROI size before decoding.
@@ -45,8 +44,8 @@ MIN_ROI_HEIGHT = 220
 MIN_ROI_WIDTH = 900
 MAX_ROI_LONG_SIDE = 2800
 
-# Small angles (degrees) to try around the assumed upright orientation.
-MICRO_ROTATIONS = [0.0, -3.0, 3.0]
+# Micro-rotations (degrees) to tolerate small skew.
+MICRO_ROTATIONS = [0.0, -4.0, 4.0, -8.0, 8.0]
 
 
 # ----------------- decoders -----------------
@@ -138,7 +137,9 @@ def _rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
     M[0, 2] += (nW / 2.0) - center[0]
     M[1, 2] += (nH / 2.0) - center[1]
 
-    return cv2.warpAffine(image, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return cv2.warpAffine(
+        image, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
 
 
 def _prepare_roi(bgr: np.ndarray) -> np.ndarray:
@@ -206,7 +207,8 @@ def _decode_single_roi(bgr: np.ndarray) -> List[str]:
         # Adaptive threshold
         try:
             ga = cv2.adaptiveThreshold(
-                g, 255,
+                g,
+                255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY,
                 31,
@@ -224,7 +226,7 @@ def _decode_single_roi(bgr: np.ndarray) -> List[str]:
 
 def _decode_candidate(bgr: np.ndarray) -> List[str]:
     """
-    Run decoders on a ROI plus a couple small-angle rotations, return all hits.
+    Run decoders on a ROI plus a few small-angle rotations, return all hits.
     """
     hits: List[str] = []
     for ang in MICRO_ROTATIONS:
@@ -266,13 +268,12 @@ def _barcode_band(bgr: np.ndarray) -> np.ndarray:
     return bgr[y0:y1, :].copy()
 
 
-def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
+def _generate_band_crops(band_bgr: np.ndarray) -> List[np.ndarray]:
     """
-    Within the band, split into one or more blobs that look like barcodes.
-
-    Returns:
-        * the entire band (first), and then
-        * up to two tighter crops found via morphology.
+    From the barcode band, generate a small set of horizontally-focused crops:
+        * full band
+        * up to two morphological "blob" crops
+        * several overlapping horizontal windows (sliding)
     """
     crops: List[np.ndarray] = []
 
@@ -280,9 +281,10 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
     if H == 0 or W == 0:
         return crops
 
-    # 0) Always include whole band
+    # 0) Full band
     crops.append(band_bgr.copy())
 
+    # 1) Morphological blobs looking for wide vertical-edge regions
     gray = cv2.cvtColor(band_bgr, cv2.COLOR_BGR2GRAY)
 
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
@@ -301,16 +303,10 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         aspect = w / max(1.0, h)
-        # wide-ish and reasonably tall
         if h > H * 0.35 and w > W * 0.10 and aspect > 2.0:
             boxes.append((x, y, w, h))
 
-    if not boxes:
-        # fall back to left/right halves
-        mid = W // 2
-        boxes = [(0, 0, mid, H), (mid, 0, W - mid, H)]
-
-    boxes.sort(key=lambda b: b[0])  # left-to-right
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)  # largest first
 
     for (x, y, w, h) in boxes[:2]:
         pad_x = max(8, int(0.02 * W))
@@ -320,6 +316,22 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
         x1 = min(W, x + w + pad_x)
         y1 = min(H, y + h + pad_y)
         crop = band_bgr[y0:y1, x0:x1].copy()
+        crops.append(crop)
+
+    # 2) Sliding horizontal windows across the band
+    #    This helps isolate the barcode away from label text on the sides.
+    win_frac = 0.55  # window width as fraction of band width
+    step_frac = 0.25  # step as fraction of band width
+    win_w = int(W * win_frac)
+    win_w = max(win_w, int(W * 0.35))  # don't get *too* narrow
+    step = max(1, int(W * step_frac))
+
+    for x0 in range(0, max(1, W - win_w + 1), step):
+        x1 = x0 + win_w
+        if x1 > W:
+            x1 = W
+            x0 = max(0, W - win_w)
+        crop = band_bgr[:, x0:x1].copy()
         crops.append(crop)
 
     return crops
@@ -348,8 +360,7 @@ def read_single_barcode(image_path: str) -> str:
     band = _barcode_band(bgr)
 
     # 2) Generate candidate crops from that band
-    candidates: List[np.ndarray] = []
-    candidates.extend(_split_into_barcode_blobs(band))
+    candidates: List[np.ndarray] = _generate_band_crops(band)
 
     # 3) Add a slightly thicker band for extra vertical margin
     H = bgr.shape[0]
@@ -359,7 +370,7 @@ def read_single_barcode(image_path: str) -> str:
     thick_band = bgr[yy0:yy1, :].copy()
     candidates.append(thick_band)
 
-    # Deduplicate candidates by shape + central pixel
+    # Deduplicate candidates by shape + central pixel (cheap heuristic)
     uniq_candidates: List[np.ndarray] = []
     seen_keys = set()
     for roi in candidates:
