@@ -33,12 +33,20 @@ from PIL import Image
 # ----------------- tunable constants -----------------
 
 # Vertical band (fraction of full height) where the barcode lives.
-# Based on your example (~0.28–0.32), this brackets that region.
-BAND_Y0_FRAC = 0.25
-BAND_Y1_FRAC = 0.34
+# Based on sample images (~0.28–0.32), this brackets that region.
+BAND_Y0_FRAC = 0.24
+BAND_Y1_FRAC = 0.36
 
 # Minimum length we consider a “real” barcode.
-MIN_BARCODE_LEN = 10
+MIN_BARCODE_LEN = 8
+
+# Target minimum ROI size before decoding.
+MIN_ROI_HEIGHT = 220
+MIN_ROI_WIDTH = 900
+MAX_ROI_LONG_SIDE = 2800
+
+# Small angles (degrees) to try around the assumed upright orientation.
+MICRO_ROTATIONS = [0.0, -3.0, 3.0]
 
 
 # ----------------- decoders -----------------
@@ -105,25 +113,50 @@ def _decode_with_cv(bgr: np.ndarray) -> List[str]:
     return []
 
 
+# ----------------- image helpers -----------------
+
+
+def _rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
+    """
+    Rotate image by angle (in degrees) keeping entire image in view.
+    """
+    if abs(angle_deg) < 1e-3:
+        return image
+
+    (h, w) = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+
+    # compute the new bounding dimensions
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+
+    # adjust the rotation matrix to take into account translation
+    M[0, 2] += (nW / 2.0) - center[0]
+    M[1, 2] += (nH / 2.0) - center[1]
+
+    return cv2.warpAffine(image, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
 def _prepare_roi(bgr: np.ndarray) -> np.ndarray:
     """
-    Normalize ROI size with a focus on vertical resolution.
+    Normalize ROI size with a focus on vertical and horizontal resolution.
 
-    * Ensure height is at least ~140 px (for thin barcodes).
-    * Ensure longest side does not exceed 2600 px.
+    * Ensure height >= MIN_ROI_HEIGHT and width >= MIN_ROI_WIDTH.
+    * Ensure longest side does not exceed MAX_ROI_LONG_SIDE.
     """
     H, W = bgr.shape[:2]
     longest = max(H, W)
 
-    scale = 1.0
+    scale_h = float(MIN_ROI_HEIGHT) / float(H) if H < MIN_ROI_HEIGHT else 1.0
+    scale_w = float(MIN_ROI_WIDTH) / float(W) if W < MIN_ROI_WIDTH else 1.0
+    scale = max(scale_h, scale_w, 1.0)
 
-    # Boost vertical resolution if needed
-    if H < 140:
-        scale = max(scale, 140.0 / float(H))
-
-    # Cap overall size
-    if longest * scale > 2600:
-        scale = 2600.0 / float(longest)
+    if longest * scale > MAX_ROI_LONG_SIDE:
+        scale = float(MAX_ROI_LONG_SIDE) / float(longest)
 
     if np.isclose(scale, 1.0):
         return bgr
@@ -131,47 +164,72 @@ def _prepare_roi(bgr: np.ndarray) -> np.ndarray:
     return cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
 
-def _decode_candidate(bgr: np.ndarray) -> List[str]:
+def _decode_single_roi(bgr: np.ndarray) -> List[str]:
     """
-    Run all decoders on a single candidate ROI, returning all raw hits.
+    Decode one upright ROI (no extra rotations) and return all hits.
     """
     roi = _prepare_roi(bgr)
     hits: List[str] = []
 
-    # OpenCV detector first (fast)
+    # OpenCV detector first (cheap)
     hits += _decode_with_cv(roi)
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray_base = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
     # Base grayscale variants: raw, equalized, CLAHE
-    variants: List[np.ndarray] = [gray]
+    variants: List[np.ndarray] = [gray_base]
 
     try:
-        eq = cv2.equalizeHist(gray)
+        eq = cv2.equalizeHist(gray_base)
         variants.append(eq)
     except Exception:
-        eq = gray
+        eq = gray_base
 
     try:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        clahe_img = clahe.apply(gray)
+        clahe_img = clahe.apply(gray_base)
         variants.append(clahe_img)
     except Exception:
         pass
 
-    # For each base variant, also try an Otsu-binary version
     all_gray_variants: List[np.ndarray] = []
     for g in variants:
         all_gray_variants.append(g)
+
+        # Otsu threshold
         try:
             thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
             all_gray_variants.append(thr)
         except Exception:
             pass
 
+        # Adaptive threshold
+        try:
+            ga = cv2.adaptiveThreshold(
+                g, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                7,
+            )
+            all_gray_variants.append(ga)
+        except Exception:
+            pass
+
     for g in all_gray_variants:
         hits += _decode_with_pyzbar_gray(g)
 
+    return hits
+
+
+def _decode_candidate(bgr: np.ndarray) -> List[str]:
+    """
+    Run decoders on a ROI plus a couple small-angle rotations, return all hits.
+    """
+    hits: List[str] = []
+    for ang in MICRO_ROTATIONS:
+        rot = _rotate_bound(bgr, ang)
+        hits += _decode_single_roi(rot)
     return hits
 
 
@@ -244,7 +302,7 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
         x, y, w, h = cv2.boundingRect(c)
         aspect = w / max(1.0, h)
         # wide-ish and reasonably tall
-        if h > H * 0.35 and w > W * 0.12 and aspect > 2.5:
+        if h > H * 0.35 and w > W * 0.10 and aspect > 2.0:
             boxes.append((x, y, w, h))
 
     if not boxes:
