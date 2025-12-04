@@ -31,6 +31,10 @@ import cv2
 import numpy as np
 from PIL import Image
 
+# Minimum length we consider a “real” barcode.
+# This filters out junk like "1" from partial / bad reads.
+MIN_BARCODE_LEN = 6
+
 
 # ----------------- decoders -----------------
 
@@ -43,7 +47,6 @@ def _decode_with_pyzbar_gray(gray: np.ndarray) -> List[str]:
         from pyzbar.pyzbar import decode as zbar_decode
         from PIL import ImageOps, ImageFilter
     except Exception:
-        # pyzbar or its native zbar dependency is missing
         return []
 
     hits: List[str] = []
@@ -52,15 +55,9 @@ def _decode_with_pyzbar_gray(gray: np.ndarray) -> List[str]:
 
     variants: List[Image.Image] = [pil_base]
     try:
-        # These are inexpensive and often help on low-contrast labels.
         variants.append(ImageOps.autocontrast(pil_base, cutoff=2))
         variants.append(ImageOps.equalize(pil_base))
         variants.append(pil_base.filter(ImageFilter.GaussianBlur(radius=0.5)))
-    except Exception:
-        pass
-
-    # Also try inverted grayscale (white bars on black vs black on white)
-    try:
         variants.append(ImageOps.invert(pil_base))
     except Exception:
         pass
@@ -103,7 +100,7 @@ def _decode_with_cv(bgr: np.ndarray) -> List[str]:
     return []
 
 
-def _normalize_size(bgr: np.ndarray, min_side: int = 700, max_side: int = 2000) -> np.ndarray:
+def _normalize_size(bgr: np.ndarray, min_side: int = 700, max_side: int = 2200) -> np.ndarray:
     """
     Resize image so the longest side is within [min_side, max_side].
     """
@@ -121,28 +118,20 @@ def _normalize_size(bgr: np.ndarray, min_side: int = 700, max_side: int = 2000) 
 
 def _decode_candidate(bgr: np.ndarray) -> List[str]:
     """
-    Run all decoders on a single candidate ROI.
-
-    This is kept reasonably cheap: one resize, OpenCV once, and a small
-    number of pyzbar passes.
+    Run all decoders on a single candidate ROI, returning *all* raw hits
+    (including short ones). Caller is responsible for filtering.
     """
     roi = _normalize_size(bgr)
-
     hits: List[str] = []
 
-    # OpenCV's detector first (if present; it's fast).
+    # OpenCV detector
     hits += _decode_with_cv(roi)
-    if hits:
-        return hits
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-    # pyzbar on gray & simple thresholded versions
+    # pyzbar on gray + simple threshold
     hits += _decode_with_pyzbar_gray(gray)
-    if hits:
-        return hits
 
-    # Otsu binary
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     hits += _decode_with_pyzbar_gray(thr)
 
@@ -152,6 +141,19 @@ def _decode_candidate(bgr: np.ndarray) -> List[str]:
 def _uniq_sort(vals: List[str]) -> List[str]:
     """Unique + sort by length (longest first), then lexicographically."""
     return sorted(set(vals), key=lambda s: (-len(s), s))
+
+
+def _best_barcode(hits: List[str]) -> str:
+    """
+    Choose best barcode from raw hits:
+        * strip whitespace
+        * drop anything shorter than MIN_BARCODE_LEN
+        * prefer longest, then lexicographically
+    """
+    cleaned = [h.strip() for h in hits if h and len(h.strip()) >= MIN_BARCODE_LEN]
+    if not cleaned:
+        return ""
+    return _uniq_sort(cleaned)[0]
 
 
 # ----------------- slab-specific regioning -----------------
@@ -189,80 +191,19 @@ def _barcode_strip_roi(label_bgr: np.ndarray) -> np.ndarray:
     return label_bgr[y0:y1].copy()
 
 
-def _barcode_crops_by_morphology(label_bgr: np.ndarray) -> List[np.ndarray]:
-    """
-    Scan the label for a dense cluster of vertical edges that looks like a
-    1D barcode band. Returns up to 2 crops.
-    """
-    gray = cv2.cvtColor(label_bgr, cv2.COLOR_BGR2GRAY)
-
-    # emphasize vertical edges
-    gradX = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gradX = cv2.convertScaleAbs(gradX)
-    gradX = cv2.GaussianBlur(gradX, (9, 9), 0)
-
-    _t, thresh = cv2.threshold(
-        gradX, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
-    )
-
-    # connect vertical bars into a single wide component
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-    closed = cv2.dilate(
-        closed, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)), iterations=1
-    )
-
-    fc = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(fc) == 3:
-        _img, contours, _hier = fc
-    else:
-        contours, _hier = fc
-
-    H, W = gray.shape
-    boxes: List[Tuple[int, int, int, int]] = []
-
-    # relaxed thresholds so we don't miss subtle bands (like NCS labels)
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        aspect = w / float(max(h, 1))
-        area = w * h
-        if aspect > 2.0 and area > 1000 and w > W * 0.10 and h > H * 0.06:
-            boxes.append((x, y, w, h))
-
-    if not boxes:
-        return []
-
-    # Sort by area (largest first).
-    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
-
-    crops: List[np.ndarray] = []
-    for (x, y, w, h) in boxes[:2]:
-        pad_x = max(8, int(0.02 * W))
-        pad_y = max(8, int(0.05 * H))
-        x0 = max(0, x - pad_x)
-        y0 = max(0, y - pad_y)
-        x1 = min(W, x + w + pad_x)
-        y1 = min(H, y + h + pad_y)
-        crop = label_bgr[y0:y1, x0:x1].copy()
-        crops.append(crop)
-
-    return crops
-
-
 def _split_into_barcode_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
     """
     Within the strip, split into one or more blobs.
 
-    Some slabs (PCGS) have two barcodes; others have one.
     Returns:
         * the entire strip (first), and then
         * up to two tighter crops found via morphology.
-
-    Kept small to avoid excessive decode work.
     """
     crops: List[np.ndarray] = []
 
     H, W = strip_bgr.shape[:2]
+    if H == 0 or W == 0:
+        return crops
 
     # Always include whole strip
     crops.append(strip_bgr.copy())
@@ -331,23 +272,24 @@ def read_single_barcode(image_path: str) -> str:
 
     # 1) Label region (top 40% of slab)
     label = _top_label_region(bgr)
-    candidates.append(label)
-
-    # 2) Bottom band of the label (where barcodes usually live)
     lh = label.shape[0]
+    if lh == 0:
+        raise ValueError("Label region is empty.")
+
+    # 2) Bottom part of label (where barcode text & bars usually sit)
     band_y0 = int(lh * 0.45)
     band = label[band_y0:, :].copy()
     candidates.append(band)
 
-    # 3) Morphological “barcode-like” crops from the whole label
-    candidates.extend(_barcode_crops_by_morphology(label))
-
-    # 4) Vertical-edge strip from label, then its internal blobs
+    # 3) Sobel-based strip within label and its internal blobs
     strip = _barcode_strip_roi(label)
     candidates.append(strip)
     candidates.extend(_split_into_barcode_blobs(strip))
 
-    # To avoid redundant work, dedupe by shape + hash of a small patch
+    # 4) As a last resort, the entire label
+    candidates.append(label)
+
+    # Deduplicate candidates by shape + central pixel
     uniq_candidates: List[np.ndarray] = []
     seen_keys = set()
     for roi in candidates:
@@ -359,13 +301,12 @@ def read_single_barcode(image_path: str) -> str:
             seen_keys.add(key)
             uniq_candidates.append(roi)
 
-    # Decode each candidate in order of "most promising" first:
-    # band, morph crops, strip blobs, then full label last.
-    # (The above construction already roughly reflects that order.)
+    # Decode each candidate; accept only barcodes >= MIN_BARCODE_LEN.
     for roi in uniq_candidates:
         hits = _decode_candidate(roi)
-        if hits:
-            return _uniq_sort(hits)[0]
+        best = _best_barcode(hits)
+        if best:
+            return best
 
     raise ValueError("No decodable barcode found.")
 
@@ -380,7 +321,10 @@ def main() -> int:
     ap.add_argument("image", help="Path to the image file.")
     args = ap.parse_args()
     try:
-        print(read_single_barcode(args.image))
+        text = read_single_barcode(args.image)
+        # If you want exact JSON as in your comment, uncomment below:
+        # print(json.dumps({"text": text}))
+        print(text)
         return 0
     except Exception as e:
         sys.stderr.write(f"Error: {e}\n")
