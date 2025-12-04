@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-read_barcode.py — robust single-barcode reader for slab images (PCGS/NGC/etc.)
+read_barcode.py — barcode reader for slab images (PCGS/NGC/etc.)
 
 Assumptions:
 
@@ -33,6 +33,7 @@ from PIL import Image
 # ----------------- tunable constants -----------------
 
 # Vertical band (fraction of full height) where the barcode lives.
+# Based on your sample (565–655 / 2027 ≈ 0.28–0.32), this brackets that region.
 BAND_Y0_FRAC = 0.22
 BAND_Y1_FRAC = 0.36
 
@@ -40,58 +41,42 @@ BAND_Y1_FRAC = 0.36
 MIN_BARCODE_LEN = 8
 
 # Target minimum ROI size before decoding.
-MIN_ROI_HEIGHT = 220
-MIN_ROI_WIDTH = 900
-MAX_ROI_LONG_SIDE = 2800
-
-# Micro-rotations (degrees) to tolerate small skew.
-MICRO_ROTATIONS = [0.0, -4.0, 4.0, -8.0, 8.0]
-
+MIN_ROI_HEIGHT = 200
+MIN_ROI_WIDTH = 800
+MAX_ROI_LONG_SIDE = 2200  # keep ROIs reasonably sized for DO
 
 # ----------------- decoders -----------------
 
 
-def _decode_with_pyzbar_gray(gray: np.ndarray) -> List[str]:
+def _decode_with_pyzbar(gray: np.ndarray) -> List[str]:
     """
-    Run pyzbar on several contrast variants of a grayscale image.
+    Run pyzbar on a single grayscale image.
 
     IMPORTANT: we explicitly restrict which symbologies zbar tries,
-    to avoid buggy DataBar paths (the source of the assertion warning).
+    to avoid buggy DataBar paths and reduce work.
     """
     try:
         from pyzbar.pyzbar import decode as zbar_decode, ZBarSymbol
-        from PIL import ImageOps, ImageFilter
     except Exception:
         return []
 
-    hits: List[str] = []
-
-    # Restrict to common 1D symbologies; NO DataBar.
+    # Restrict to common linear symbologies; NO DataBar.
     SYMBOLS = [
         ZBarSymbol.CODE128,
-        ZBarSymbol.I25
+        ZBarSymbol.I25,
     ]
+    # If you know it's always Code128, you can tighten to:
+    # SYMBOLS = [ZBarSymbol.CODE128]
 
-    pil_base = Image.fromarray(gray)
-
-    variants: List[Image.Image] = [pil_base]
+    pil_img = Image.fromarray(gray)
+    hits: List[str] = []
     try:
-        variants.append(ImageOps.autocontrast(pil_base, cutoff=2))
-        variants.append(ImageOps.equalize(pil_base))
-        variants.append(pil_base.filter(ImageFilter.GaussianBlur(radius=0.5)))
-        variants.append(ImageOps.invert(pil_base))
+        for r in zbar_decode(pil_img, symbols=SYMBOLS):
+            s = r.data.decode("utf-8", "replace")
+            if s:
+                hits.append(s)
     except Exception:
         pass
-
-    for im in variants:
-        try:
-            for r in zbar_decode(im, symbols=SYMBOLS):
-                s = r.data.decode("utf-8", "replace")
-                if s:
-                    hits.append(s)
-        except Exception:
-            continue
-
     return hits
 
 
@@ -121,34 +106,7 @@ def _decode_with_cv(bgr: np.ndarray) -> List[str]:
     return []
 
 
-# ----------------- image helpers -----------------
-
-
-def _rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
-    """
-    Rotate image by angle (in degrees) keeping entire image in view.
-    """
-    if abs(angle_deg) < 1e-3:
-        return image
-
-    (h, w) = image.shape[:2]
-    center = (w / 2.0, h / 2.0)
-
-    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-    cos = abs(M[0, 0])
-    sin = abs(M[0, 1])
-
-    # compute the new bounding dimensions
-    nW = int((h * sin) + (w * cos))
-    nH = int((h * cos) + (w * sin))
-
-    # adjust the rotation matrix to take into account translation
-    M[0, 2] += (nW / 2.0) - center[0]
-    M[1, 2] += (nH / 2.0) - center[1]
-
-    return cv2.warpAffine(
-        image, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-    )
+# ----------------- helpers -----------------
 
 
 def _prepare_roi(bgr: np.ndarray) -> np.ndarray:
@@ -172,76 +130,6 @@ def _prepare_roi(bgr: np.ndarray) -> np.ndarray:
         return bgr
 
     return cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-
-def _decode_single_roi(bgr: np.ndarray) -> List[str]:
-    """
-    Decode one upright ROI (no extra rotations) and return all hits.
-    """
-    roi = _prepare_roi(bgr)
-    hits: List[str] = []
-
-    # OpenCV detector first (cheap)
-    hits += _decode_with_cv(roi)
-
-    gray_base = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    # Base grayscale variants: raw, equalized, CLAHE
-    variants: List[np.ndarray] = [gray_base]
-
-    try:
-        eq = cv2.equalizeHist(gray_base)
-        variants.append(eq)
-    except Exception:
-        eq = gray_base
-
-    try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        clahe_img = clahe.apply(gray_base)
-        variants.append(clahe_img)
-    except Exception:
-        pass
-
-    all_gray_variants: List[np.ndarray] = []
-    for g in variants:
-        all_gray_variants.append(g)
-
-        # Otsu threshold
-        try:
-            thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-            all_gray_variants.append(thr)
-        except Exception:
-            pass
-
-        # Adaptive threshold
-        try:
-            ga = cv2.adaptiveThreshold(
-                g,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                31,
-                7,
-            )
-            all_gray_variants.append(ga)
-        except Exception:
-            pass
-
-    for g in all_gray_variants:
-        hits += _decode_with_pyzbar_gray(g)
-
-    return hits
-
-
-def _decode_candidate(bgr: np.ndarray) -> List[str]:
-    """
-    Run decoders on a ROI plus a few small-angle rotations, return all hits.
-    """
-    hits: List[str] = []
-    for ang in MICRO_ROTATIONS:
-        rot = _rotate_bound(bgr, ang)
-        hits += _decode_single_roi(rot)
-    return hits
 
 
 def _uniq_sort(vals: List[str]) -> List[str]:
@@ -277,12 +165,14 @@ def _barcode_band(bgr: np.ndarray) -> np.ndarray:
     return bgr[y0:y1, :].copy()
 
 
-def _generate_band_crops(band_bgr: np.ndarray) -> List[np.ndarray]:
+def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
     """
-    From the barcode band, generate a small set of horizontally-focused crops:
-        * full band
-        * up to two morphological "blob" crops
-        * several overlapping horizontal windows (sliding)
+    Within the band, split into one or more blobs that look like barcodes.
+
+    Returns:
+        * up to two tighter crops found via morphology.
+
+    (Full band is handled separately by the caller.)
     """
     crops: List[np.ndarray] = []
 
@@ -290,10 +180,6 @@ def _generate_band_crops(band_bgr: np.ndarray) -> List[np.ndarray]:
     if H == 0 or W == 0:
         return crops
 
-    # 0) Full band
-    crops.append(band_bgr.copy())
-
-    # 1) Morphological blobs looking for wide vertical-edge regions
     gray = cv2.cvtColor(band_bgr, cv2.COLOR_BGR2GRAY)
 
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
@@ -312,8 +198,12 @@ def _generate_band_crops(band_bgr: np.ndarray) -> List[np.ndarray]:
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         aspect = w / max(1.0, h)
+        # wide-ish and reasonably tall
         if h > H * 0.35 and w > W * 0.10 and aspect > 2.0:
             boxes.append((x, y, w, h))
+
+    if not boxes:
+        return crops
 
     boxes.sort(key=lambda b: b[2] * b[3], reverse=True)  # largest first
 
@@ -327,22 +217,56 @@ def _generate_band_crops(band_bgr: np.ndarray) -> List[np.ndarray]:
         crop = band_bgr[y0:y1, x0:x1].copy()
         crops.append(crop)
 
-    # 2) Sliding horizontal windows across the band
-    win_frac = 0.55  # window width as fraction of band width
-    step_frac = 0.25  # step as fraction of band width
-    win_w = int(W * win_frac)
-    win_w = max(win_w, int(W * 0.35))
-    step = max(1, int(W * step_frac))
-
-    for x0 in range(0, max(1, W - win_w + 1), step):
-        x1 = x0 + win_w
-        if x1 > W:
-            x1 = W
-            x0 = max(0, W - win_w)
-        crop = band_bgr[:, x0:x1].copy()
-        crops.append(crop)
-
     return crops
+
+
+# ----------------- decoding per ROI -----------------
+
+
+def _decode_roi(bgr: np.ndarray) -> str:
+    """
+    Try to decode a single ROI. Returns best barcode text or "".
+    """
+    roi = _prepare_roi(bgr)
+
+    # 1) Try OpenCV detector once on the color ROI.
+    cv_hits = _decode_with_cv(roi)
+    best_cv = _best_barcode(cv_hits)
+    if best_cv:
+        return best_cv
+
+    # 2) Build a small set of grayscale variants and run pyzbar on each.
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    variants: List[np.ndarray] = [gray]
+
+    # Equalized gray
+    try:
+        eq = cv2.equalizeHist(gray)
+    except Exception:
+        eq = gray
+    variants.append(eq)
+
+    # Otsu on equalized
+    try:
+        thr = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    except Exception:
+        thr = eq
+    variants.append(thr)
+
+    # Inverted Otsu
+    variants.append(255 - thr)
+
+    all_hits: List[str] = []
+    for g in variants:
+        hits = _decode_with_pyzbar(g)
+        if hits:
+            all_hits.extend(hits)
+            best = _best_barcode(all_hits)
+            if best:
+                return best
+
+    return ""
 
 
 # ----------------- main API -----------------
@@ -366,11 +290,22 @@ def read_single_barcode(image_path: str) -> str:
 
     # 1) Extract the vertical barcode band
     band = _barcode_band(bgr)
+    if band.size == 0:
+        raise ValueError("Barcode band is empty.")
 
-    # 2) Generate candidate crops from that band
-    candidates: List[np.ndarray] = _generate_band_crops(band)
+    # 2) Build a small list of candidate ROIs:
+    #    - full band
+    #    - up to two morphology-based blobs inside the band
+    #    - slightly thicker band for extra vertical margin
+    candidates: List[np.ndarray] = []
 
-    # 3) Add a slightly thicker band for extra vertical margin
+    # full band
+    candidates.append(band)
+
+    # blobs
+    candidates.extend(_split_into_barcode_blobs(band))
+
+    # slightly thicker band
     H = bgr.shape[0]
     pad_y = int(H * 0.03)
     yy0 = max(0, int(H * BAND_Y0_FRAC) - pad_y)
@@ -378,7 +313,7 @@ def read_single_barcode(image_path: str) -> str:
     thick_band = bgr[yy0:yy1, :].copy()
     candidates.append(thick_band)
 
-    # Deduplicate candidates by shape + central pixel
+    # Deduplicate candidates by shape + central pixel (cheap heuristic)
     uniq_candidates: List[np.ndarray] = []
     seen_keys = set()
     for roi in candidates:
@@ -390,12 +325,11 @@ def read_single_barcode(image_path: str) -> str:
             seen_keys.add(key)
             uniq_candidates.append(roi)
 
-    # 4) Decode each candidate; accept only barcodes >= MIN_BARCODE_LEN.
+    # 3) Try decoding each candidate in order.
     for roi in uniq_candidates:
-        hits = _decode_candidate(roi)
-        best = _best_barcode(hits)
-        if best:
-            return best
+        text = _decode_roi(roi)
+        if text:
+            return text
 
     raise ValueError("No decodable barcode found.")
 
