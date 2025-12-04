@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
 """
-read_barcode.py — barcode reader for slab images (PCGS/NGC/etc.)
+read_barcode.py — robust single-barcode reader for slab images (PCGS/NGC/etc.)
 
 Assumptions:
 
 * Slab image is already in the correct orientation (no rotation needed).
 * Image is in color.
-* Barcode is always roughly between 26% and 36% of the full image height.
+* Barcode is always in the top ~40% of the image (label region).
+
+Strategy:
+
+1. Take the top ~40% of the image as the label area.
+2. Within that label, compute vertical gradient energy per row and pick
+   the top few peak rows (where 1D barcodes tend to live).
+3. Around each peak row, extract a horizontal strip (~10–12% of label height).
+4. For each strip:
+   - Try decoding the whole strip.
+   - Use morphology to find wide "barcode-like" blobs inside the strip and
+     try decoding up to two tight blobs.
+5. Decoding uses:
+   - OpenCV's BarcodeDetector (if available).
+   - pyzbar on a few contrast/threshold variants of the ROI.
+   - Only linear symbologies (no DataBar) and a minimum length filter
+     to avoid junk reads like "1".
 
 Usage:
     python read_barcode.py /path/to/image.jpg
@@ -32,18 +48,24 @@ from PIL import Image
 
 # ----------------- tunable constants -----------------
 
-# Vertical band (fraction of full height) where the barcode lives.
-# Based on your sample (565–655 / 2027 ≈ 0.28–0.32), this brackets that region.
-BAND_Y0_FRAC = 0.22
-BAND_Y1_FRAC = 0.36
+# Label region: top fraction of the image height.
+LABEL_TOP_FRAC = 0.40
 
-# Minimum length we consider a “real” barcode (ignore junk like "1").
+# Horizontal strips: how many candidate peak rows in the label to use.
+MAX_STRIPS = 3
+# Minimum vertical distance between two chosen peak rows, as fraction of label height
+PEAK_SEPARATION_FRAC = 0.15
+
+# Horizontal strip height as fraction of label height.
+STRIP_HEIGHT_FRAC = 0.12  # ~12% of label height
+
+# Minimum length we consider a “real” barcode (ignore tiny junk like "1").
 MIN_BARCODE_LEN = 8
 
 # Target minimum ROI size before decoding.
 MIN_ROI_HEIGHT = 200
 MIN_ROI_WIDTH = 800
-MAX_ROI_LONG_SIDE = 2200  # keep ROIs reasonably sized for DO
+MAX_ROI_LONG_SIDE = 2200  # keep ROIs reasonably sized
 
 # ----------------- decoders -----------------
 
@@ -52,7 +74,7 @@ def _decode_with_pyzbar(gray: np.ndarray) -> List[str]:
     """
     Run pyzbar on a single grayscale image.
 
-    IMPORTANT: we explicitly restrict which symbologies zbar tries,
+    IMPORTANT: we explicitly restrict which symbologies zbar tries
     to avoid buggy DataBar paths and reduce work.
     """
     try:
@@ -63,9 +85,16 @@ def _decode_with_pyzbar(gray: np.ndarray) -> List[str]:
     # Restrict to common linear symbologies; NO DataBar.
     SYMBOLS = [
         ZBarSymbol.CODE128,
-        ZBarSymbol.I25,
+        ZBarSymbol.CODE39,
+        ZBarSymbol.CODE93,
+        ZBarSymbol.I25,     # Interleaved 2 of 5
+        ZBarSymbol.EAN13,
+        ZBarSymbol.EAN8,
+        ZBarSymbol.UPCA,
+        ZBarSymbol.UPCE,
+        ZBarSymbol.CODABAR,
     ]
-    # If you know it's always Code128, you can tighten to:
+    # If you know these slabs are always Code128, you can tighten to:
     # SYMBOLS = [ZBarSymbol.CODE128]
 
     pil_img = Image.fromarray(gray)
@@ -150,37 +179,71 @@ def _best_barcode(hits: List[str]) -> str:
     return _uniq_sort(cleaned)[0]
 
 
-# ----------------- region selection -----------------
+# ----------------- label & strip selection -----------------
 
 
-def _barcode_band(bgr: np.ndarray) -> np.ndarray:
+def _top_label_region(bgr: np.ndarray) -> np.ndarray:
     """
-    Extract the vertical band (fraction of full height) where the barcode lives.
+    Return the top LABEL_TOP_FRAC of the image height as the label region.
     """
     H = bgr.shape[0]
-    y0 = int(H * BAND_Y0_FRAC)
-    y1 = int(H * BAND_Y1_FRAC)
-    y0 = max(0, min(H, y0))
-    y1 = max(y0 + 1, min(H, y1))
-    return bgr[y0:y1, :].copy()
+    return bgr[: int(H * LABEL_TOP_FRAC)].copy()
 
 
-def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
+def _find_strip_centers(label_bgr: np.ndarray) -> List[int]:
     """
-    Within the band, split into one or more blobs that look like barcodes.
+    Find up to MAX_STRIPS row indices (within the label) where vertical
+    edge energy is highest, enforcing separation so we don't pick the same
+    area repeatedly.
 
-    Returns:
-        * up to two tighter crops found via morphology.
+    Returns list of row indices (relative to label_bgr).
+    """
+    gray = cv2.cvtColor(label_bgr, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gx = cv2.convertScaleAbs(gx)
+    row_energy = gx.mean(axis=1)
+    # smooth the 1D signal a bit
+    row_energy = cv2.GaussianBlur(row_energy.reshape(-1, 1), (1, 9), 0).ravel()
 
-    (Full band is handled separately by the caller.)
+    H = label_bgr.shape[0]
+    indices = np.argsort(row_energy)[::-1]  # highest energy first
+
+    centers: List[int] = []
+    min_sep = int(H * PEAK_SEPARATION_FRAC)
+
+    for idx in indices:
+        if len(centers) >= MAX_STRIPS:
+            break
+        if any(abs(idx - c) < min_sep for c in centers):
+            continue
+        centers.append(int(idx))
+
+    centers.sort()
+    return centers
+
+
+def _extract_strip(label_bgr: np.ndarray, center_row: int) -> np.ndarray:
+    """
+    Extract a horizontal strip around center_row within the label.
+    """
+    H = label_bgr.shape[0]
+    win = max(24, int(H * STRIP_HEIGHT_FRAC))
+    y0 = max(0, center_row - win // 2)
+    y1 = min(H, y0 + win)
+    return label_bgr[y0:y1].copy()
+
+
+def _split_strip_into_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
+    """
+    Within a strip, find up to two tight "barcode-like" blobs via morphology.
     """
     crops: List[np.ndarray] = []
 
-    H, W = band_bgr.shape[:2]
+    H, W = strip_bgr.shape[:2]
     if H == 0 or W == 0:
         return crops
 
-    gray = cv2.cvtColor(band_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2GRAY)
 
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     thr = 255 - thr  # make bars white for morphology
@@ -205,7 +268,8 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
     if not boxes:
         return crops
 
-    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)  # largest first
+    # Largest areas first
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
 
     for (x, y, w, h) in boxes[:2]:
         pad_x = max(8, int(0.02 * W))
@@ -214,7 +278,7 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
         y0 = max(0, y - pad_y)
         x1 = min(W, x + w + pad_x)
         y1 = min(H, y + h + pad_y)
-        crop = band_bgr[y0:y1, x0:x1].copy()
+        crop = strip_bgr[y0:y1, x0:x1].copy()
         crops.append(crop)
 
     return crops
@@ -288,32 +352,31 @@ def read_single_barcode(image_path: str) -> str:
     if bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
-    # 1) Extract the vertical barcode band
-    band = _barcode_band(bgr)
-    if band.size == 0:
-        raise ValueError("Barcode band is empty.")
+    # 1) Restrict to the label region (top ~40%).
+    label = _top_label_region(bgr)
+    if label.size == 0:
+        raise ValueError("Label region is empty.")
 
-    # 2) Build a small list of candidate ROIs:
-    #    - full band
-    #    - up to two morphology-based blobs inside the band
-    #    - slightly thicker band for extra vertical margin
+    # 2) Find up to MAX_STRIPS candidate strip centers by vertical edge energy.
+    centers = _find_strip_centers(label)
+    if not centers:
+        raise ValueError("Could not find any candidate barcode strips.")
+
+    # 3) Build candidate ROIs:
+    #    - the strips themselves
+    #    - up to two morphology-based blobs inside each strip
     candidates: List[np.ndarray] = []
+    for c in centers:
+        strip = _extract_strip(label, c)
+        if strip.size == 0:
+            continue
+        candidates.append(strip)
+        candidates.extend(_split_strip_into_blobs(strip))
 
-    # full band
-    candidates.append(band)
+    # As a final fallback, add the whole label (just in case our strips miss).
+    candidates.append(label)
 
-    # blobs
-    candidates.extend(_split_into_barcode_blobs(band))
-
-    # slightly thicker band
-    H = bgr.shape[0]
-    pad_y = int(H * 0.03)
-    yy0 = max(0, int(H * BAND_Y0_FRAC) - pad_y)
-    yy1 = min(H, int(H * BAND_Y1_FRAC) + pad_y)
-    thick_band = bgr[yy0:yy1, :].copy()
-    candidates.append(thick_band)
-
-    # Deduplicate candidates by shape + central pixel (cheap heuristic)
+    # 4) Deduplicate candidates by shape + central pixel (cheap heuristic)
     uniq_candidates: List[np.ndarray] = []
     seen_keys = set()
     for roi in candidates:
@@ -325,7 +388,7 @@ def read_single_barcode(image_path: str) -> str:
             seen_keys.add(key)
             uniq_candidates.append(roi)
 
-    # 3) Try decoding each candidate in order.
+    # 5) Try decoding each candidate in order.
     for roi in uniq_candidates:
         text = _decode_roi(roi)
         if text:
