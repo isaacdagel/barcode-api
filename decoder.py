@@ -34,7 +34,7 @@ from PIL import Image
 
 # Vertical band (fraction of full height) where the barcode lives.
 # Based on sample images (~0.28–0.32), this brackets that region.
-BAND_Y0_FRAC = 0.24
+BAND_Y0_FRAC = 0.22
 BAND_Y1_FRAC = 0.36
 
 # Minimum length we consider a “real” barcode.
