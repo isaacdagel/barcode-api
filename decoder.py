@@ -54,14 +54,23 @@ MICRO_ROTATIONS = [0.0, -4.0, 4.0, -8.0, 8.0]
 def _decode_with_pyzbar_gray(gray: np.ndarray) -> List[str]:
     """
     Run pyzbar on several contrast variants of a grayscale image.
+
+    IMPORTANT: we explicitly restrict which symbologies zbar tries,
+    to avoid buggy DataBar paths (the source of the assertion warning).
     """
     try:
-        from pyzbar.pyzbar import decode as zbar_decode
+        from pyzbar.pyzbar import decode as zbar_decode, ZBarSymbol
         from PIL import ImageOps, ImageFilter
     except Exception:
         return []
 
     hits: List[str] = []
+
+    # Restrict to common 1D symbologies; NO DataBar.
+    SYMBOLS = [
+        ZBarSymbol.CODE128,
+        ZBarSymbol.I25
+    ]
 
     pil_base = Image.fromarray(gray)
 
@@ -76,7 +85,7 @@ def _decode_with_pyzbar_gray(gray: np.ndarray) -> List[str]:
 
     for im in variants:
         try:
-            for r in zbar_decode(im):
+            for r in zbar_decode(im, symbols=SYMBOLS):
                 s = r.data.decode("utf-8", "replace")
                 if s:
                     hits.append(s)
@@ -319,11 +328,10 @@ def _generate_band_crops(band_bgr: np.ndarray) -> List[np.ndarray]:
         crops.append(crop)
 
     # 2) Sliding horizontal windows across the band
-    #    This helps isolate the barcode away from label text on the sides.
     win_frac = 0.55  # window width as fraction of band width
     step_frac = 0.25  # step as fraction of band width
     win_w = int(W * win_frac)
-    win_w = max(win_w, int(W * 0.35))  # don't get *too* narrow
+    win_w = max(win_w, int(W * 0.35))
     step = max(1, int(W * step_frac))
 
     for x0 in range(0, max(1, W - win_w + 1), step):
@@ -370,7 +378,7 @@ def read_single_barcode(image_path: str) -> str:
     thick_band = bgr[yy0:yy1, :].copy()
     candidates.append(thick_band)
 
-    # Deduplicate candidates by shape + central pixel (cheap heuristic)
+    # Deduplicate candidates by shape + central pixel
     uniq_candidates: List[np.ndarray] = []
     seen_keys = set()
     for roi in candidates:
