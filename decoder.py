@@ -35,12 +35,9 @@ from PIL import Image
 # ----------------- decoders -----------------
 
 
-def _decode_with_pyzbar(pil_img: Image.Image) -> List[str]:
+def _decode_with_pyzbar_gray(gray: np.ndarray) -> List[str]:
     """
-    Run pyzbar on several contrast/denoise variants of a grayscale image.
-
-    Using multiple simple variants is cheap but helps a lot on low-contrast,
-    finely-printed labels such as NGC/NCS slabs.
+    Run pyzbar on several contrast variants of a grayscale image.
     """
     try:
         from pyzbar.pyzbar import decode as zbar_decode
@@ -51,17 +48,21 @@ def _decode_with_pyzbar(pil_img: Image.Image) -> List[str]:
 
     hits: List[str] = []
 
-    base = pil_img.convert("L")
+    pil_base = Image.fromarray(gray)
 
-    variants: List[Image.Image] = [base]
+    variants: List[Image.Image] = [pil_base]
     try:
-        # autocontrast and histogram equalization often make the bars "pop"
-        variants.append(ImageOps.autocontrast(base, cutoff=2))
-        variants.append(ImageOps.equalize(base))
-        # a tiny blur can suppress small speckle noise
-        variants.append(base.filter(ImageFilter.GaussianBlur(radius=0.5)))
+        # These are inexpensive and often help on low-contrast labels.
+        variants.append(ImageOps.autocontrast(pil_base, cutoff=2))
+        variants.append(ImageOps.equalize(pil_base))
+        variants.append(pil_base.filter(ImageFilter.GaussianBlur(radius=0.5)))
     except Exception:
-        # If any of the above fails, we still have at least `base`.
+        pass
+
+    # Also try inverted grayscale (white bars on black vs black on white)
+    try:
+        variants.append(ImageOps.invert(pil_base))
+    except Exception:
         pass
 
     for im in variants:
@@ -71,7 +72,6 @@ def _decode_with_pyzbar(pil_img: Image.Image) -> List[str]:
                 if s:
                     hits.append(s)
         except Exception:
-            # Some builds of zbar can be finicky with certain formats; just skip.
             continue
 
     return hits
@@ -103,42 +103,48 @@ def _decode_with_cv(bgr: np.ndarray) -> List[str]:
     return []
 
 
-def _try_all_decoders(bgr: np.ndarray) -> List[str]:
+def _normalize_size(bgr: np.ndarray, min_side: int = 700, max_side: int = 2000) -> np.ndarray:
     """
-    Try OpenCV + pyzbar on a single ROI.
-
-    This function is intentionally *lightweight* because it will be called
-    multiple times on different candidate regions.
-
-    Strategy:
-        * Normalize size so the longest side is roughly 700–2000 px.
-        * Run OpenCV's BarcodeDetector (if present).
-        * Run pyzbar on normal + inverted grayscale variants.
+    Resize image so the longest side is within [min_side, max_side].
     """
     H, W = bgr.shape[:2]
     longest = max(H, W)
     scale = 1.0
-    if longest < 700:
-        scale = 700.0 / float(longest)
-    elif longest > 2000:
-        scale = 2000.0 / float(longest)
-    if not np.isclose(scale, 1.0):
-        bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    if longest < min_side:
+        scale = float(min_side) / float(longest)
+    elif longest > max_side:
+        scale = float(max_side) / float(longest)
+    if np.isclose(scale, 1.0):
+        return bgr
+    return cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+
+def _decode_candidate(bgr: np.ndarray) -> List[str]:
+    """
+    Run all decoders on a single candidate ROI.
+
+    This is kept reasonably cheap: one resize, OpenCV once, and a small
+    number of pyzbar passes.
+    """
+    roi = _normalize_size(bgr)
 
     hits: List[str] = []
 
-    # OpenCV (if available)
-    hits += _decode_with_cv(bgr)
+    # OpenCV's detector first (if present; it's fast).
+    hits += _decode_with_cv(roi)
+    if hits:
+        return hits
 
-    # pyzbar on grayscale + inverted grayscale
-    pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-    hits += _decode_with_pyzbar(pil)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-    try:
-        from PIL import ImageOps
-        hits += _decode_with_pyzbar(ImageOps.invert(pil))
-    except Exception:
-        pass
+    # pyzbar on gray & simple thresholded versions
+    hits += _decode_with_pyzbar_gray(gray)
+    if hits:
+        return hits
+
+    # Otsu binary
+    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    hits += _decode_with_pyzbar_gray(thr)
 
     return hits
 
@@ -153,9 +159,7 @@ def _uniq_sort(vals: List[str]) -> List[str]:
 
 def _top_label_region(bgr: np.ndarray) -> np.ndarray:
     """
-    Return top ~40% (covers label area on the slabs this script targets).
-
-    The caller has guaranteed that the barcode is in this band.
+    Return top ~40% (covers label area on slabs this script targets).
     """
     H = bgr.shape[0]
     return bgr[: int(H * 0.40)].copy()
@@ -163,13 +167,13 @@ def _top_label_region(bgr: np.ndarray) -> np.ndarray:
 
 def _barcode_strip_roi(label_bgr: np.ndarray) -> np.ndarray:
     """
-    Find a horizontal strip likely to contain the barcode.
+    Find a horizontal strip in the label with the strongest vertical edges.
 
     Heuristic:
         * Compute vertical gradients (Sobel X) on the label.
         * For each row, measure mean gradient magnitude.
         * Smooth that 1-D signal and pick the row with maximum energy.
-        * Return a band of height ~10–15% of the label, centered there.
+        * Return a band of height ~10% of the label centered there.
     """
     gray = cv2.cvtColor(label_bgr, cv2.COLOR_BGR2GRAY)
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
@@ -185,31 +189,89 @@ def _barcode_strip_roi(label_bgr: np.ndarray) -> np.ndarray:
     return label_bgr[y0:y1].copy()
 
 
+def _barcode_crops_by_morphology(label_bgr: np.ndarray) -> List[np.ndarray]:
+    """
+    Scan the label for a dense cluster of vertical edges that looks like a
+    1D barcode band. Returns up to 2 crops.
+    """
+    gray = cv2.cvtColor(label_bgr, cv2.COLOR_BGR2GRAY)
+
+    # emphasize vertical edges
+    gradX = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gradX = cv2.convertScaleAbs(gradX)
+    gradX = cv2.GaussianBlur(gradX, (9, 9), 0)
+
+    _t, thresh = cv2.threshold(
+        gradX, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
+    )
+
+    # connect vertical bars into a single wide component
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    closed = cv2.dilate(
+        closed, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)), iterations=1
+    )
+
+    fc = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(fc) == 3:
+        _img, contours, _hier = fc
+    else:
+        contours, _hier = fc
+
+    H, W = gray.shape
+    boxes: List[Tuple[int, int, int, int]] = []
+
+    # relaxed thresholds so we don't miss subtle bands (like NCS labels)
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = w / float(max(h, 1))
+        area = w * h
+        if aspect > 2.0 and area > 1000 and w > W * 0.10 and h > H * 0.06:
+            boxes.append((x, y, w, h))
+
+    if not boxes:
+        return []
+
+    # Sort by area (largest first).
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+
+    crops: List[np.ndarray] = []
+    for (x, y, w, h) in boxes[:2]:
+        pad_x = max(8, int(0.02 * W))
+        pad_y = max(8, int(0.05 * H))
+        x0 = max(0, x - pad_x)
+        y0 = max(0, y - pad_y)
+        x1 = min(W, x + w + pad_x)
+        y1 = min(H, y + h + pad_y)
+        crop = label_bgr[y0:y1, x0:x1].copy()
+        crops.append(crop)
+
+    return crops
+
+
 def _split_into_barcode_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
     """
-    Split the strip into one or more blobs.
+    Within the strip, split into one or more blobs.
 
-    Some slabs (PCGS) have two barcodes; others (NGC/NCS) have one.
-    This routine returns:
-        * The whole strip (first), and then
+    Some slabs (PCGS) have two barcodes; others have one.
+    Returns:
+        * the entire strip (first), and then
         * up to two tighter crops found via morphology.
 
-    The number of returned crops is small by design to keep decoding fast.
+    Kept small to avoid excessive decode work.
     """
     crops: List[np.ndarray] = []
 
     H, W = strip_bgr.shape[:2]
 
-    # Always include the whole strip as a candidate
+    # Always include whole strip
     crops.append(strip_bgr.copy())
 
     gray = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2GRAY)
 
-    # strong binarization to emphasize bars
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     thr = 255 - thr  # make bars white for morphology
 
-    # connect vertical strokes into components
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 3))
     closed = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -227,13 +289,13 @@ def _split_into_barcode_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
             boxes.append((x, y, w, h))
 
     if not boxes:
-        # fall back to left/right halves to be safe
+        # fall back to left/right halves
         mid = W // 2
         boxes = [(0, 0, mid, H), (mid, 0, W - mid, H)]
 
     boxes.sort(key=lambda b: b[0])  # left-to-right
 
-    for (x, y, w, h) in boxes[:2]:  # at most 2 additional crops
+    for (x, y, w, h) in boxes[:2]:
         pad_x = max(8, int(0.02 * W))
         pad_y = max(8, int(0.05 * H))
         x0 = max(0, x - pad_x)
@@ -251,7 +313,7 @@ def _split_into_barcode_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
 
 def read_single_barcode(image_path: str) -> str:
     """
-    Top-level helper: read the single barcode embedded in a slab image.
+    Read the single barcode embedded in a slab image.
 
     Raises:
         FileNotFoundError
@@ -265,22 +327,43 @@ def read_single_barcode(image_path: str) -> str:
     if bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
-    # 1) Restrict work to the label region (top 40% of the slab).
+    candidates: List[np.ndarray] = []
+
+    # 1) Label region (top 40% of slab)
     label = _top_label_region(bgr)
+    candidates.append(label)
 
-    # 2) Quick attempt on the entire label.
-    hits = _try_all_decoders(label)
-    if hits:
-        return _uniq_sort(hits)[0]
+    # 2) Bottom band of the label (where barcodes usually live)
+    lh = label.shape[0]
+    band_y0 = int(lh * 0.45)
+    band = label[band_y0:, :].copy()
+    candidates.append(band)
 
-    # 3) Focus on the horizontal barcode strip inside the label.
+    # 3) Morphological “barcode-like” crops from the whole label
+    candidates.extend(_barcode_crops_by_morphology(label))
+
+    # 4) Vertical-edge strip from label, then its internal blobs
     strip = _barcode_strip_roi(label)
+    candidates.append(strip)
+    candidates.extend(_split_into_barcode_blobs(strip))
 
-    # 4) Split the strip into a small number of candidate blobs and test each.
-    crops = _split_into_barcode_blobs(strip)
+    # To avoid redundant work, dedupe by shape + hash of a small patch
+    uniq_candidates: List[np.ndarray] = []
+    seen_keys = set()
+    for roi in candidates:
+        if roi.size == 0:
+            continue
+        H, W = roi.shape[:2]
+        key = (H, W, tuple(roi[H // 2, W // 2].tolist()))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            uniq_candidates.append(roi)
 
-    for crop in crops:
-        hits = _try_all_decoders(crop)
+    # Decode each candidate in order of "most promising" first:
+    # band, morph crops, strip blobs, then full label last.
+    # (The above construction already roughly reflects that order.)
+    for roi in uniq_candidates:
+        hits = _decode_candidate(roi)
         if hits:
             return _uniq_sort(hits)[0]
 
