@@ -25,7 +25,6 @@ import cv2
 import numpy as np
 from PIL import Image
 
-
 # ----------------- decoders -----------------
 
 
@@ -64,7 +63,6 @@ def _decode_with_pyzbar(pil_img: Image.Image) -> List[str]:
                 if s:
                     hits.append(s)
         except Exception:
-            # Some builds of zbar can be finicky with certain formats; just skip.
             continue
 
     return hits
@@ -98,14 +96,14 @@ def _decode_with_cv(bgr: np.ndarray) -> List[str]:
 
 def _try_all_decoders(bgr: np.ndarray) -> List[str]:
     """
-    Try both OpenCV & pyzbar on normal and inverted images.
+    Try both OpenCV & pyzbar on normal and inverted images,
+    with a light size normalization.
     """
     out: List[str] = []
 
-    # Optionally rescale very small or huge images to a "comfortable" size
     H, W = bgr.shape[:2]
-    scale = 1.0
     longest = max(H, W)
+    scale = 1.0
     if longest < 700:
         scale = 700.0 / float(longest)
     elif longest > 2600:
@@ -125,9 +123,7 @@ def _try_all_decoders(bgr: np.ndarray) -> List[str]:
 
 
 def _uniq_sort(vals: List[str]) -> List[str]:
-    """
-    Unique + sort by length (longest first), then lexicographically.
-    """
+    """Unique + sort by length (longest first), then lexicographically."""
     return sorted(set(vals), key=lambda s: (-len(s), s))
 
 
@@ -169,7 +165,7 @@ def _candidate_label_strips(label_bgr: np.ndarray) -> List[np.ndarray]:
     # 1) Original “max vertical edges” strip
     strips.append(_barcode_strip_roi(label_bgr))
 
-    # 2) Central band: a good default for many NGC / NCS layouts
+    # 2) Central band
     y0 = int(H * 0.30)
     y1 = int(H * 0.70)
     strips.append(label_bgr[y0:y1].copy())
@@ -179,7 +175,7 @@ def _candidate_label_strips(label_bgr: np.ndarray) -> List[np.ndarray]:
     y1 = int(H * 0.95)
     strips.append(label_bgr[y0:y1].copy())
 
-    # Ensure uniqueness by shape (avoid exact duplicates)
+    # Ensure uniqueness by shape
     uniq: List[np.ndarray] = []
     seen_shapes = set()
     for s in strips:
@@ -230,8 +226,6 @@ def _split_into_barcode_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         aspect = w / max(1.0, h)
-        # Slightly more forgiving than before: allow a bit shorter and narrower,
-        # but still enforce "wide-ish" components.
         if h > H * 0.30 and w > W * 0.06 and aspect > 1.8:
             boxes.append((x, y, w, h))
 
@@ -244,7 +238,7 @@ def _split_into_barcode_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
     boxes.sort(key=lambda b: b[0])
 
     for (x, y, w, h) in boxes[:3]:
-        # more generous padding to preserve quiet zones
+        # generous padding to preserve quiet zones
         pad_x = max(8, int(0.02 * W))
         pad_y = max(8, int(0.05 * H))
         x0 = max(0, x - pad_x)
@@ -253,6 +247,80 @@ def _split_into_barcode_blobs(strip_bgr: np.ndarray) -> List[np.ndarray]:
         y1 = min(H, y + h + pad_y)
         crop = strip_bgr[y0:y1, x0:x1].copy()
 
+        if max(crop.shape[:2]) < 1800:
+            crop = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        crops.append(crop)
+
+    return crops
+
+
+# -------- NEW: full-label morphological barcode detector ---------
+
+
+def _barcode_crops_by_morphology(label_bgr: np.ndarray) -> List[np.ndarray]:
+    """
+    Scan the entire label for a dense cluster of vertical edges that
+    looks like a 1D barcode. This is especially helpful for NGC/NCS slabs
+    where the barcode is a small band at the very bottom of the label.
+    """
+    gray = cv2.cvtColor(label_bgr, cv2.COLOR_BGR2GRAY)
+
+    # emphasize vertical edges
+    gradX = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gradX = cv2.convertScaleAbs(gradX)
+    gradX = cv2.GaussianBlur(gradX, (9, 9), 0)
+
+    # binarize based on edge strength
+    _t, thresh = cv2.threshold(
+        gradX, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
+    )
+
+    # connect vertical strokes into one big component
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # slightly dilate vertically so the box covers the whole bar height
+    closed = cv2.dilate(
+        closed, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)), iterations=1
+    )
+
+    fc = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(fc) == 3:
+        _img, contours, _hier = fc
+    else:
+        contours, _hier = fc
+
+    H, W = gray.shape
+    boxes: List[Tuple[int, int, int, int]] = []
+
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = w / float(max(h, 1))
+        area = w * h
+        # wide, reasonably tall strip somewhere in the label
+        if (
+            aspect > 2.5
+            and area > 2000
+            and w > W * 0.15
+            and h > H * 0.08
+        ):
+            boxes.append((x, y, w, h))
+
+    if not boxes:
+        return []
+
+    # Sort by area (largest first) – the main barcode band wins.
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+
+    crops: List[np.ndarray] = []
+    for (x, y, w, h) in boxes[:3]:
+        pad_x = max(8, int(0.02 * W))
+        pad_y = max(8, int(0.05 * H))
+        x0 = max(0, x - pad_x)
+        y0 = max(0, y - pad_y)
+        x1 = min(W, x + w + pad_x)
+        y1 = min(H, y + h + pad_y)
+        crop = label_bgr[y0:y1, x0:x1].copy()
         if max(crop.shape[:2]) < 1800:
             crop = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         crops.append(crop)
@@ -272,36 +340,64 @@ def read_single_barcode(image_path: str) -> str:
     if bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
-    # 0) Quick whole-frame tries (sometimes enough)
     rotations = (
         None,
         cv2.ROTATE_90_CLOCKWISE,
         cv2.ROTATE_180,
         cv2.ROTATE_90_COUNTERCLOCKWISE,
     )
+
+    # 0) Quick whole-frame tries (sometimes enough)
     for rot in rotations:
         arr = bgr if rot is None else cv2.rotate(bgr, rot)
         hits = _try_all_decoders(arr)
         if hits:
             return _uniq_sort(hits)[0]
 
-    # 1) Focus on the top label, generate several candidate strips
+    # 1) Focus on the top label
     label = _top_label_region(bgr)
+
+    # 1a) NEW: full-label morphological barcode detector
+    morph_crops = _barcode_crops_by_morphology(label)
+    for crop in morph_crops:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        variants = [
+            crop,
+            cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
+            cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )[1],
+            cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                35,
+                11,
+            ),
+        ]
+        for v in variants:
+            for rot in rotations:
+                vv = v if rot is None else cv2.rotate(v, rot)
+                hits = _try_all_decoders(vv)
+                if hits:
+                    return _uniq_sort(hits)[0]
+
+    # 1b) Fallback: strip-based logic (original + improved)
     strips = _candidate_label_strips(label)
 
-    # 2) For each strip: try decoding the strip as-is, then split into blobs
     for strip in strips:
-        # First: straight attempt on the whole strip (no blob splitting)
+        # First try decoding the whole strip as-is
         for rot in rotations:
             arr = strip if rot is None else cv2.rotate(strip, rot)
             hits = _try_all_decoders(arr)
             if hits:
                 return _uniq_sort(hits)[0]
 
-        # Then: split into barcode blobs (handles PCGS/NGC layouts)
+        # Then split into barcode blobs
         crops = _split_into_barcode_blobs(strip)
 
-        # 3) Decode each crop with several preprocess variants
+        # Decode each crop with several preprocess variants
         for crop in crops:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             variants = [
