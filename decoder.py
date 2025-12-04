@@ -6,8 +6,7 @@ Assumptions:
 
 * Slab image is already in the correct orientation (no rotation needed).
 * Image is in color.
-* Barcode is always roughly between 25% and 35% of the full image height.
-  (Example you gave: H≈2027, barcode ≈ 565–655 → 27.9–32.3%.)
+* Barcode is always roughly between 26% and 36% of the full image height.
 
 Usage:
     python read_barcode.py /path/to/image.jpg
@@ -33,15 +32,14 @@ from PIL import Image
 
 # ----------------- tunable constants -----------------
 
-# The vertical band (fraction of full height) where the barcode lives.
-# Based on your coordinates (~0.28–0.32), this band is centered at 0.30
-# with a bit of padding on each side.
-BAND_Y0_FRAC = 0.22
-BAND_Y1_FRAC = 0.38
+# Vertical band (fraction of full height) where the barcode lives.
+# Based on your example (~0.28–0.32), this brackets that region.
+BAND_Y0_FRAC = 0.25
+BAND_Y1_FRAC = 0.34
 
 # Minimum length we consider a “real” barcode.
-# All of your examples are long (>= 12–16 chars), so 8 is a safe cutoff.
-MIN_BARCODE_LEN = 8
+MIN_BARCODE_LEN = 10
+
 
 # ----------------- decoders -----------------
 
@@ -107,21 +105,29 @@ def _decode_with_cv(bgr: np.ndarray) -> List[str]:
     return []
 
 
-def _normalize_size(
-    bgr: np.ndarray, min_side: int = 700, max_side: int = 2600
-) -> np.ndarray:
+def _prepare_roi(bgr: np.ndarray) -> np.ndarray:
     """
-    Resize image so the longest side is within [min_side, max_side].
+    Normalize ROI size with a focus on vertical resolution.
+
+    * Ensure height is at least ~140 px (for thin barcodes).
+    * Ensure longest side does not exceed 2600 px.
     """
     H, W = bgr.shape[:2]
     longest = max(H, W)
+
     scale = 1.0
-    if longest < min_side:
-        scale = float(min_side) / float(longest)
-    elif longest > max_side:
-        scale = float(max_side) / float(longest)
+
+    # Boost vertical resolution if needed
+    if H < 140:
+        scale = max(scale, 140.0 / float(H))
+
+    # Cap overall size
+    if longest * scale > 2600:
+        scale = 2600.0 / float(longest)
+
     if np.isclose(scale, 1.0):
         return bgr
+
     return cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
 
@@ -129,18 +135,42 @@ def _decode_candidate(bgr: np.ndarray) -> List[str]:
     """
     Run all decoders on a single candidate ROI, returning all raw hits.
     """
-    roi = _normalize_size(bgr)
+    roi = _prepare_roi(bgr)
     hits: List[str] = []
 
-    # OpenCV detector first
+    # OpenCV detector first (fast)
     hits += _decode_with_cv(roi)
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-    # pyzbar on gray + Otsu-thresholded gray
-    hits += _decode_with_pyzbar_gray(gray)
-    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    hits += _decode_with_pyzbar_gray(thr)
+    # Base grayscale variants: raw, equalized, CLAHE
+    variants: List[np.ndarray] = [gray]
+
+    try:
+        eq = cv2.equalizeHist(gray)
+        variants.append(eq)
+    except Exception:
+        eq = gray
+
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_img = clahe.apply(gray)
+        variants.append(clahe_img)
+    except Exception:
+        pass
+
+    # For each base variant, also try an Otsu-binary version
+    all_gray_variants: List[np.ndarray] = []
+    for g in variants:
+        all_gray_variants.append(g)
+        try:
+            thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            all_gray_variants.append(thr)
+        except Exception:
+            pass
+
+    for g in all_gray_variants:
+        hits += _decode_with_pyzbar_gray(g)
 
     return hits
 
@@ -169,9 +199,6 @@ def _best_barcode(hits: List[str]) -> str:
 def _barcode_band(bgr: np.ndarray) -> np.ndarray:
     """
     Extract the vertical band (fraction of full height) where the barcode lives.
-
-    We *do not* try to isolate the label; we rely on fixed fractions instead,
-    since your slabs have very consistent layout.
     """
     H = bgr.shape[0]
     y0 = int(H * BAND_Y0_FRAC)
@@ -259,20 +286,19 @@ def read_single_barcode(image_path: str) -> str:
     if bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
-    # 1) Extract the vertical barcode band (fixed fraction of height)
+    # 1) Extract the vertical barcode band
     band = _barcode_band(bgr)
 
-    # 2) Generate a small set of candidate crops
+    # 2) Generate candidate crops from that band
     candidates: List[np.ndarray] = []
-    candidates.append(band)
     candidates.extend(_split_into_barcode_blobs(band))
 
-    # Also add a slightly thicker band (for extra vertical margin)
+    # 3) Add a slightly thicker band for extra vertical margin
     H = bgr.shape[0]
     pad_y = int(H * 0.03)
-    y0 = max(0, int(H * BAND_Y0_FRAC) - pad_y)
-    y1 = min(H, int(H * BAND_Y1_FRAC) + pad_y)
-    thick_band = bgr[y0:y1, :].copy()
+    yy0 = max(0, int(H * BAND_Y0_FRAC) - pad_y)
+    yy1 = min(H, int(H * BAND_Y1_FRAC) + pad_y)
+    thick_band = bgr[yy0:yy1, :].copy()
     candidates.append(thick_band)
 
     # Deduplicate candidates by shape + central pixel
@@ -287,7 +313,7 @@ def read_single_barcode(image_path: str) -> str:
             seen_keys.add(key)
             uniq_candidates.append(roi)
 
-    # 3) Decode each candidate; accept only barcodes >= MIN_BARCODE_LEN.
+    # 4) Decode each candidate; accept only barcodes >= MIN_BARCODE_LEN.
     for roi in uniq_candidates:
         hits = _decode_candidate(roi)
         best = _best_barcode(hits)
@@ -309,7 +335,7 @@ def main() -> int:
     try:
         text = read_single_barcode(args.image)
         print(text)
-        # If you prefer JSON output instead, replace with:
+        # If you prefer JSON output:
         # import json; print(json.dumps({"text": text}))
         return 0
     except Exception as e:
