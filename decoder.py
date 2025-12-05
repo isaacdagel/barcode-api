@@ -36,15 +36,15 @@ from PIL import Image
 # ----------------- tunable constants -----------------
 
 # Primary search band (fraction of full height) where barcode is most likely
-PRIMARY_Y0_FRAC = 0.20
+# Adjusted to cover both upper label area and middle band
+PRIMARY_Y0_FRAC = 0.08
 PRIMARY_Y1_FRAC = 0.42
 
 # Secondary search bands to check before full-image fallback
 SECONDARY_BANDS = [
-    (0.10, 0.25),  # Upper region
     (0.40, 0.55),  # Lower region
     (0.55, 0.70),  # Even lower
-    (0.05, 0.20),  # Top edge
+    (0.02, 0.15),  # Very top edge (some NCS labels)
     (0.70, 0.85),  # Bottom area
 ]
 
@@ -82,14 +82,7 @@ def _decode_with_pyzbar(gray: np.ndarray) -> List[str]:
     # Restrict to common linear symbologies; NO DataBar.
     SYMBOLS = [
         ZBarSymbol.CODE128,
-        ZBarSymbol.CODE39,
-        ZBarSymbol.CODE93,
         ZBarSymbol.I25,
-        ZBarSymbol.EAN13,
-        ZBarSymbol.EAN8,
-        ZBarSymbol.UPCA,
-        ZBarSymbol.UPCE,
-        ZBarSymbol.CODABAR,
     ]
 
     pil_img = Image.fromarray(gray)
@@ -261,10 +254,17 @@ def _uniq_sort(vals: List[str]) -> List[str]:
 def _best_barcode(hits: List[str]) -> str:
     """
     Choose best barcode from raw hits.
+    Prefers longer barcodes (slab IDs are typically 13-16 chars).
     """
     cleaned = [h.strip() for h in hits if h and len(h.strip()) >= MIN_BARCODE_LEN]
     if not cleaned:
         return ""
+    
+    # Prefer barcodes >= 13 characters (typical slab ID length)
+    long_codes = [c for c in cleaned if len(c) >= 13]
+    if long_codes:
+        return _uniq_sort(long_codes)[0]
+    
     return _uniq_sort(cleaned)[0]
 
 
@@ -492,11 +492,18 @@ def read_single_barcode(image_path: str) -> str:
                 seen_keys.add(key)
                 uniq_candidates.append(roi)
         
-        # Try decoding each candidate with full processing
+        # Collect ALL barcodes from all candidates, then pick best
+        all_phase1_hits: List[str] = []
         for roi in uniq_candidates:
             text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True)
             if text:
-                return text
+                all_phase1_hits.append(text)
+        
+        # Choose the best barcode from all Phase 1 results
+        if all_phase1_hits:
+            best = _best_barcode(all_phase1_hits)
+            if best:
+                return best
 
     # ========== Phase 2: Secondary bands ==========
     for y0_frac, y1_frac in SECONDARY_BANDS:
