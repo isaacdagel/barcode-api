@@ -28,6 +28,8 @@ import argparse
 import sys
 from pathlib import Path
 from typing import List, Tuple, Set
+import tempfile
+import urllib.request
 
 import cv2
 import numpy as np
@@ -82,7 +84,14 @@ def _decode_with_pyzbar(gray: np.ndarray) -> List[str]:
     # Restrict to common linear symbologies; NO DataBar.
     SYMBOLS = [
         ZBarSymbol.CODE128,
+        ZBarSymbol.CODE39,
+        ZBarSymbol.CODE93,
         ZBarSymbol.I25,
+        ZBarSymbol.EAN13,
+        ZBarSymbol.EAN8,
+        ZBarSymbol.UPCA,
+        ZBarSymbol.UPCE,
+        ZBarSymbol.CODABAR,
     ]
 
     pil_img = Image.fromarray(gray)
@@ -347,18 +356,21 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
 # ----------------- decoding per ROI -----------------
 
 
-def _try_decode_single_roi(bgr: np.ndarray, thorough: bool = True) -> str:
+def _try_decode_single_roi(bgr: np.ndarray, thorough: bool = True, debug: bool = False) -> str:
     """
     Try to decode a single ROI at its current size/rotation.
     
     Args:
         bgr: BGR image ROI
         thorough: If True, use all preprocessing. If False, use faster subset.
+        debug: If True, print all detected barcodes
     """
     roi = _prepare_roi(bgr)
 
     # 1) Try OpenCV detector on color ROI
     cv_hits = _decode_with_cv(roi)
+    if debug and cv_hits:
+        print(f"[DEBUG] OpenCV found: {cv_hits}", file=sys.stderr)
     best_cv = _best_barcode(cv_hits)
     if best_cv:
         return best_cv
@@ -371,6 +383,8 @@ def _try_decode_single_roi(bgr: np.ndarray, thorough: bool = True) -> str:
     for g in variants:
         hits = _decode_with_pyzbar(g)
         if hits:
+            if debug:
+                print(f"[DEBUG] pyzbar found: {hits}", file=sys.stderr)
             all_hits.extend(hits)
             best = _best_barcode(all_hits)
             if best:
@@ -379,7 +393,7 @@ def _try_decode_single_roi(bgr: np.ndarray, thorough: bool = True) -> str:
     return ""
 
 
-def _try_with_rotation(bgr: np.ndarray, angles: List[int], thorough: bool = True) -> str:
+def _try_with_rotation(bgr: np.ndarray, angles: List[int], thorough: bool = True, debug: bool = False) -> str:
     """
     Try decoding with small rotation angles.
     """
@@ -394,14 +408,14 @@ def _try_with_rotation(bgr: np.ndarray, angles: List[int], thorough: bool = True
         else:
             rotated = bgr
 
-        result = _try_decode_single_roi(rotated, thorough=thorough)
+        result = _try_decode_single_roi(rotated, thorough=thorough, debug=debug)
         if result:
             return result
 
     return ""
 
 
-def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thorough: bool = True) -> str:
+def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thorough: bool = True, debug: bool = False) -> str:
     """
     Try to decode a single ROI with multiple scales and rotations.
     
@@ -410,6 +424,7 @@ def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thoroug
         scales: Scale factors to try
         angles: Rotation angles to try
         thorough: If True, use all preprocessing. If False, use faster subset.
+        debug: If True, print all detected barcodes
     """
     # Try multiple scale factors
     for scale in scales:
@@ -420,7 +435,7 @@ def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thoroug
             scaled = bgr
 
         # For each scale, try rotations
-        result = _try_with_rotation(scaled, angles, thorough=thorough)
+        result = _try_with_rotation(scaled, angles, thorough=thorough, debug=debug)
         if result:
             return result
 
@@ -430,7 +445,7 @@ def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thoroug
 # ----------------- main API -----------------
 
 
-def read_single_barcode(image_path: str) -> str:
+def read_single_barcode(image_path: str, debug: bool = False) -> str:
     """
     Read the single barcode embedded in a slab image.
     
@@ -495,14 +510,18 @@ def read_single_barcode(image_path: str) -> str:
         # Collect ALL barcodes from all candidates, then pick best
         all_phase1_hits: List[str] = []
         for roi in uniq_candidates:
-            text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True)
+            text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True, debug=debug)
             if text:
                 all_phase1_hits.append(text)
         
         # Choose the best barcode from all Phase 1 results
         if all_phase1_hits:
+            if debug:
+                print(f"[DEBUG] Phase 1 all hits: {all_phase1_hits}", file=sys.stderr)
             best = _best_barcode(all_phase1_hits)
             if best:
+                if debug:
+                    print(f"[DEBUG] Phase 1 chose: {best}", file=sys.stderr)
                 return best
 
     # ========== Phase 2: Secondary bands ==========
@@ -516,13 +535,13 @@ def read_single_barcode(image_path: str) -> str:
             for roi in candidates:
                 if roi.size == 0:
                     continue
-                text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True)
+                text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True, debug=debug)
                 if text:
                     return text
 
     # ========== Phase 3: Full image fallback (reduced processing) ==========
     # Use fewer scales/rotations and faster preprocessing to maintain speed
-    text = _decode_roi(bgr, SCALE_FACTORS_FULLIMG, ROTATION_ANGLES_FULLIMG, thorough=False)
+    text = _decode_roi(bgr, SCALE_FACTORS_FULLIMG, ROTATION_ANGLES_FULLIMG, thorough=False, debug=debug)
     if text:
         return text
 
@@ -536,10 +555,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Read the single barcode in an image and print its text."
     )
-    ap.add_argument("image", help="Path to the image file.")
+    ap.add_argument("image", help="Path or URL to the image file.")
+    ap.add_argument("--debug", action="store_true", help="Enable debug output")
     args = ap.parse_args()
     try:
-        text = read_single_barcode(args.image)
+        text = read_single_barcode(args.image, debug=args.debug)
         print(text)
         return 0
     except Exception as e:
