@@ -2,7 +2,7 @@
 """
 read_barcode.py — Enhanced barcode reader for slab images (PCGS/NGC/etc.)
 
-VERSION: 2.0-URL-SUPPORT
+VERSION: 2.1-OPTIMIZED
 
 Improvements:
 - Expanded preprocessing variants (adaptive threshold, bilateral filter, CLAHE, etc.)
@@ -13,6 +13,8 @@ Improvements:
 - Full-image fallback with priority search
 - Maintains high reliability with broader coverage
 - URL support for remote images
+- Early exit optimization when long barcode found
+- Reduced candidate processing for speed
 
 Usage:
     python read_barcode.py /path/to/image.jpg
@@ -478,8 +480,12 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
     """
     Read the single barcode embedded in a slab image.
     
+    Args:
+        image_path: Local file path or HTTP(S) URL to the image
+        debug: Enable debug output
+    
     Strategy:
-    1. Search primary band (20-42%) with full processing
+    1. Search primary band (8-42%) with full processing
     2. Search secondary bands with full processing
     3. Fall back to full image with reduced processing
     
@@ -489,13 +495,53 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
         FileNotFoundError
         ValueError if the image cannot be read or no barcode is decodable.
     """
-    p = Path(image_path)
-    if not p.exists():
-        raise FileNotFoundError(image_path)
+    if debug:
+        print(f"[DEBUG] image_path type: {type(image_path)}", file=sys.stderr)
+        print(f"[DEBUG] image_path value: '{image_path}'", file=sys.stderr)
+    
+    # Handle URLs
+    if image_path.startswith(('http://', 'https://')):
+        tmp_path = None
+        try:
+            if debug:
+                print(f"[DEBUG] Downloading from URL: {image_path}", file=sys.stderr)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                tmp_path = tmp.name
+            
+            urllib.request.urlretrieve(image_path, tmp_path)
+            
+            if debug:
+                print(f"[DEBUG] Download complete, reading image...", file=sys.stderr)
+            
+            bgr = cv2.imread(tmp_path)
+            
+            if bgr is None:
+                raise ValueError(f"Could not read downloaded image from URL: {image_path}")
+            
+            if debug:
+                print(f"[DEBUG] Image loaded: {bgr.shape}", file=sys.stderr)
+                
+        except Exception as e:
+            raise ValueError(f"Failed to process URL {image_path}: {type(e).__name__}: {e}")
+        finally:
+            # Clean up temp file
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink()
+                except Exception:
+                    pass
+    else:
+        if debug:
+            print(f"[DEBUG] Treating as local file path", file=sys.stderr)
+        # Handle local files
+        p = Path(image_path)
+        if not p.exists():
+            raise FileNotFoundError(image_path)
 
-    bgr = cv2.imread(str(p))
-    if bgr is None:
-        raise ValueError(f"Could not read image: {image_path}")
+        bgr = cv2.imread(str(p))
+        if bgr is None:
+            raise ValueError(f"Could not read image: {image_path}")
 
     H = bgr.shape[0]
 
@@ -579,8 +625,6 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
 
 
 def main() -> int:
-    print("[DEBUG] Script version: 2.0-URL-SUPPORT", file=sys.stderr)
-    
     ap = argparse.ArgumentParser(
         description="Read the single barcode in an image and print its text."
     )
@@ -588,18 +632,12 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
     args = ap.parse_args()
     
-    if args.debug:
-        print(f"[DEBUG] Starting with image: {args.image}", file=sys.stderr)
-        print(f"[DEBUG] About to call read_single_barcode()", file=sys.stderr)
-    
     try:
         text = read_single_barcode(args.image, debug=args.debug)
         print(text)
         return 0
     except FileNotFoundError as e:
-        import traceback
         sys.stderr.write(f"Error: File not found: {e}\n")
-        traceback.print_exc(file=sys.stderr)
         return 1
     except ValueError as e:
         sys.stderr.write(f"Error: {e}\n")
