@@ -464,8 +464,12 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
     """
     Read the single barcode embedded in a slab image.
     
+    Args:
+        image_path: Local file path or HTTP(S) URL to the image
+        debug: Enable debug output
+    
     Strategy:
-    1. Search primary band (20-42%) with full processing
+    1. Search primary band (8-42%) with full processing
     2. Search secondary bands with full processing
     3. Fall back to full image with reduced processing
     
@@ -475,13 +479,62 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
         FileNotFoundError
         ValueError if the image cannot be read or no barcode is decodable.
     """
-    p = Path(image_path)
-    if not p.exists():
-        raise FileNotFoundError(image_path)
+    # ALWAYS print this to verify function is being called
+    print(f"[DEBUG ENTRY] Function called with: '{image_path}'", file=sys.stderr)
+    print(f"[DEBUG ENTRY] First 10 chars as bytes: {image_path[:10].encode()}", file=sys.stderr)
+    print(f"[DEBUG ENTRY] Checking startswith: {image_path.startswith(('http://', 'https://'))}", file=sys.stderr)
+    
+    if debug:
+        print(f"[DEBUG] image_path type: {type(image_path)}", file=sys.stderr)
+        print(f"[DEBUG] image_path value: '{image_path}'", file=sys.stderr)
+        print(f"[DEBUG] Starts with http?: {image_path.startswith(('http://', 'https://'))}", file=sys.stderr)
+    
+    # Handle URLs
+    if image_path.startswith(('http://', 'https://')):
+        tmp_path = None
+        try:
+            if debug:
+                print(f"[DEBUG] Downloading from URL: {image_path}", file=sys.stderr)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                tmp_path = tmp.name
+            
+            if debug:
+                print(f"[DEBUG] Saving to temp file: {tmp_path}", file=sys.stderr)
+            
+            urllib.request.urlretrieve(image_path, tmp_path)
+            
+            if debug:
+                print(f"[DEBUG] Download complete, reading image...", file=sys.stderr)
+            
+            bgr = cv2.imread(tmp_path)
+            
+            if bgr is None:
+                raise ValueError(f"Could not read downloaded image from URL: {image_path}")
+            
+            if debug:
+                print(f"[DEBUG] Image loaded: {bgr.shape}", file=sys.stderr)
+                
+        except Exception as e:
+            raise ValueError(f"Failed to process URL {image_path}: {type(e).__name__}: {e}")
+        finally:
+            # Clean up temp file
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink()
+                except Exception:
+                    pass
+    else:
+        if debug:
+            print(f"[DEBUG] Treating as local file path", file=sys.stderr)
+        # Handle local files
+        p = Path(image_path)
+        if not p.exists():
+            raise FileNotFoundError(image_path)
 
-    bgr = cv2.imread(str(p))
-    if bgr is None:
-        raise ValueError(f"Could not read image: {image_path}")
+        bgr = cv2.imread(str(p))
+        if bgr is None:
+            raise ValueError(f"Could not read image: {image_path}")
 
     H = bgr.shape[0]
 
