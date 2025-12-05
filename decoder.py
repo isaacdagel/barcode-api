@@ -8,8 +8,8 @@ Improvements:
 - Small rotation tolerance
 - Relaxed blob detection parameters
 - Sharpening filter
-- Wider vertical band search
-- More thorough variant testing
+- Full-image fallback with priority search
+- Maintains high reliability with broader coverage
 
 Usage:
     python read_barcode.py /path/to/image.jpg
@@ -35,10 +35,18 @@ from PIL import Image
 
 # ----------------- tunable constants -----------------
 
-# Vertical band (fraction of full height) where the barcode lives.
-# Widened from 0.26-0.36 to catch more edge cases
-BAND_Y0_FRAC = 0.20
-BAND_Y1_FRAC = 0.42
+# Primary search band (fraction of full height) where barcode is most likely
+PRIMARY_Y0_FRAC = 0.20
+PRIMARY_Y1_FRAC = 0.42
+
+# Secondary search bands to check before full-image fallback
+SECONDARY_BANDS = [
+    (0.10, 0.25),  # Upper region
+    (0.40, 0.55),  # Lower region
+    (0.55, 0.70),  # Even lower
+    (0.05, 0.20),  # Top edge
+    (0.70, 0.85),  # Bottom area
+]
 
 # Minimum length we consider a "real" barcode (ignore junk like "1").
 MIN_BARCODE_LEN = 8
@@ -53,6 +61,10 @@ SCALE_FACTORS = [1.0, 1.5, 2.0, 0.75, 2.5]
 
 # Small rotation angles to try (degrees)
 ROTATION_ANGLES = [0, -2, 2, -5, 5, -1, 1, -3, 3]
+
+# For full-image fallback: use fewer variants to maintain speed
+SCALE_FACTORS_FULLIMG = [1.0, 1.5, 2.0]
+ROTATION_ANGLES_FULLIMG = [0, -2, 2]
 
 # ----------------- decoders -----------------
 
@@ -129,10 +141,13 @@ def _sharpen_image(gray: np.ndarray) -> np.ndarray:
     return cv2.filter2D(gray, -1, kernel)
 
 
-def _generate_preprocessing_variants(gray: np.ndarray) -> List[np.ndarray]:
+def _generate_preprocessing_variants(gray: np.ndarray, thorough: bool = True) -> List[np.ndarray]:
     """
-    Generate comprehensive preprocessing variants for difficult barcodes.
-    Returns a list of grayscale images to try decoding.
+    Generate preprocessing variants for difficult barcodes.
+    
+    Args:
+        gray: Input grayscale image
+        thorough: If True, generate all variants. If False, use faster subset.
     """
     variants: List[np.ndarray] = []
     
@@ -161,43 +176,52 @@ def _generate_preprocessing_variants(gray: np.ndarray) -> List[np.ndarray]:
     except Exception:
         clahe_img = gray
     
-    # Bilateral filter (reduces noise while preserving edges)
-    try:
-        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-        variants.append(bilateral)
-    except Exception:
-        bilateral = gray
-    
-    # Adaptive thresholding (better for uneven lighting)
-    try:
-        adaptive_mean = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        )
-        variants.append(adaptive_mean)
-        variants.append(255 - adaptive_mean)
-        
-        adaptive_gauss = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2
-        )
-        variants.append(adaptive_gauss)
-        variants.append(255 - adaptive_gauss)
-    except Exception:
-        pass
-    
-    # Morphological gradient (emphasizes bar edges)
-    try:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
-        variants.append(gradient)
-    except Exception:
-        pass
-    
-    # Otsu thresholding on multiple inputs
-    for img in [gray, eq, bilateral, clahe_img, sharpened]:
+    if thorough:
+        # Bilateral filter (reduces noise while preserving edges)
         try:
-            _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+            variants.append(bilateral)
+        except Exception:
+            bilateral = gray
+        
+        # Adaptive thresholding (better for uneven lighting)
+        try:
+            adaptive_mean = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY, 11, 2
+            )
+            variants.append(adaptive_mean)
+            variants.append(255 - adaptive_mean)
+            
+            adaptive_gauss = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
+            )
+            variants.append(adaptive_gauss)
+            variants.append(255 - adaptive_gauss)
+        except Exception:
+            pass
+        
+        # Morphological gradient (emphasizes bar edges)
+        try:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
+            variants.append(gradient)
+        except Exception:
+            pass
+        
+        # Otsu thresholding on multiple inputs
+        for img in [gray, eq, bilateral, clahe_img, sharpened]:
+            try:
+                _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                variants.append(otsu)
+                variants.append(255 - otsu)
+            except Exception:
+                pass
+    else:
+        # Fast subset for full-image fallback
+        try:
+            _, otsu = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             variants.append(otsu)
             variants.append(255 - otsu)
         except Exception:
@@ -247,13 +271,13 @@ def _best_barcode(hits: List[str]) -> str:
 # ----------------- region selection -----------------
 
 
-def _barcode_band(bgr: np.ndarray) -> np.ndarray:
+def _extract_band(bgr: np.ndarray, y0_frac: float, y1_frac: float) -> np.ndarray:
     """
-    Extract the vertical band (fraction of full height) where the barcode lives.
+    Extract a horizontal band from the image.
     """
     H = bgr.shape[0]
-    y0 = int(H * BAND_Y0_FRAC)
-    y1 = int(H * BAND_Y1_FRAC)
+    y0 = int(H * y0_frac)
+    y1 = int(H * y1_frac)
     y0 = max(0, min(H, y0))
     y1 = max(y0 + 1, min(H, y1))
     return bgr[y0:y1, :].copy()
@@ -288,7 +312,7 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
             aspect = w / max(1.0, h)
-            # Relaxed constraints: was h > 0.35*H, w > 0.10*W, aspect > 2.0
+            # Relaxed constraints
             if h > H * 0.25 and w > W * 0.08 and aspect > 1.5:
                 all_boxes.append((x, y, w, h))
 
@@ -307,7 +331,7 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
 
     unique_boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
 
-    for (x, y, w, h) in unique_boxes[:3]:  # Take top 3 instead of 2
+    for (x, y, w, h) in unique_boxes[:3]:  # Take top 3
         pad_x = max(8, int(0.02 * W))
         pad_y = max(8, int(0.10 * H))
         x0 = max(0, x - pad_x)
@@ -323,9 +347,13 @@ def _split_into_barcode_blobs(band_bgr: np.ndarray) -> List[np.ndarray]:
 # ----------------- decoding per ROI -----------------
 
 
-def _try_decode_single_roi(bgr: np.ndarray) -> str:
+def _try_decode_single_roi(bgr: np.ndarray, thorough: bool = True) -> str:
     """
     Try to decode a single ROI at its current size/rotation.
+    
+    Args:
+        bgr: BGR image ROI
+        thorough: If True, use all preprocessing. If False, use faster subset.
     """
     roi = _prepare_roi(bgr)
 
@@ -335,9 +363,9 @@ def _try_decode_single_roi(bgr: np.ndarray) -> str:
     if best_cv:
         return best_cv
 
-    # 2) Generate comprehensive preprocessing variants
+    # 2) Generate preprocessing variants
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    variants = _generate_preprocessing_variants(gray)
+    variants = _generate_preprocessing_variants(gray, thorough=thorough)
 
     all_hits: List[str] = []
     for g in variants:
@@ -351,14 +379,14 @@ def _try_decode_single_roi(bgr: np.ndarray) -> str:
     return ""
 
 
-def _try_with_rotation(bgr: np.ndarray) -> str:
+def _try_with_rotation(bgr: np.ndarray, angles: List[int], thorough: bool = True) -> str:
     """
     Try decoding with small rotation angles.
     """
     H, W = bgr.shape[:2]
     center = (W // 2, H // 2)
 
-    for angle in ROTATION_ANGLES:
+    for angle in angles:
         if angle != 0:
             M = cv2.getRotationMatrix2D(center, angle, 1.0)
             rotated = cv2.warpAffine(bgr, M, (W, H),
@@ -366,19 +394,25 @@ def _try_with_rotation(bgr: np.ndarray) -> str:
         else:
             rotated = bgr
 
-        result = _try_decode_single_roi(rotated)
+        result = _try_decode_single_roi(rotated, thorough=thorough)
         if result:
             return result
 
     return ""
 
 
-def _decode_roi(bgr: np.ndarray) -> str:
+def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thorough: bool = True) -> str:
     """
     Try to decode a single ROI with multiple scales and rotations.
+    
+    Args:
+        bgr: BGR image ROI
+        scales: Scale factors to try
+        angles: Rotation angles to try
+        thorough: If True, use all preprocessing. If False, use faster subset.
     """
     # Try multiple scale factors
-    for scale in SCALE_FACTORS:
+    for scale in scales:
         if scale != 1.0:
             scaled = cv2.resize(bgr, None, fx=scale, fy=scale,
                                interpolation=cv2.INTER_CUBIC)
@@ -386,7 +420,7 @@ def _decode_roi(bgr: np.ndarray) -> str:
             scaled = bgr
 
         # For each scale, try rotations
-        result = _try_with_rotation(scaled)
+        result = _try_with_rotation(scaled, angles, thorough=thorough)
         if result:
             return result
 
@@ -399,6 +433,13 @@ def _decode_roi(bgr: np.ndarray) -> str:
 def read_single_barcode(image_path: str) -> str:
     """
     Read the single barcode embedded in a slab image.
+    
+    Strategy:
+    1. Search primary band (20-42%) with full processing
+    2. Search secondary bands with full processing
+    3. Fall back to full image with reduced processing
+    
+    This maintains high reliability while covering the entire image.
 
     Raises:
         FileNotFoundError
@@ -412,52 +453,71 @@ def read_single_barcode(image_path: str) -> str:
     if bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
-    # 1) Extract the vertical barcode band
-    band = _barcode_band(bgr)
-    if band.size == 0:
-        raise ValueError("Barcode band is empty.")
-
-    # 2) Build candidate ROIs
-    candidates: List[np.ndarray] = []
-
-    # Full band
-    candidates.append(band)
-
-    # Morphology-based blobs
-    candidates.extend(_split_into_barcode_blobs(band))
-
-    # Slightly thicker band for extra vertical margin
     H = bgr.shape[0]
-    pad_y = int(H * 0.03)
-    yy0 = max(0, int(H * BAND_Y0_FRAC) - pad_y)
-    yy1 = min(H, int(H * BAND_Y1_FRAC) + pad_y)
-    thick_band = bgr[yy0:yy1, :].copy()
-    candidates.append(thick_band)
 
-    # Even thicker band for stubborn cases
-    pad_y_large = int(H * 0.05)
-    yy0_large = max(0, int(H * BAND_Y0_FRAC) - pad_y_large)
-    yy1_large = min(H, int(H * BAND_Y1_FRAC) + pad_y_large)
-    thick_band_large = bgr[yy0_large:yy1_large, :].copy()
-    candidates.append(thick_band_large)
+    # ========== Phase 1: Primary band (highest probability) ==========
+    band = _extract_band(bgr, PRIMARY_Y0_FRAC, PRIMARY_Y1_FRAC)
+    if band.size > 0:
+        candidates: List[np.ndarray] = []
+        
+        # Full band
+        candidates.append(band)
+        
+        # Morphology-based blobs
+        candidates.extend(_split_into_barcode_blobs(band))
+        
+        # Slightly thicker band
+        pad_y = int(H * 0.03)
+        yy0 = max(0, int(H * PRIMARY_Y0_FRAC) - pad_y)
+        yy1 = min(H, int(H * PRIMARY_Y1_FRAC) + pad_y)
+        thick_band = bgr[yy0:yy1, :].copy()
+        candidates.append(thick_band)
+        
+        # Even thicker band
+        pad_y_large = int(H * 0.05)
+        yy0_large = max(0, int(H * PRIMARY_Y0_FRAC) - pad_y_large)
+        yy1_large = min(H, int(H * PRIMARY_Y1_FRAC) + pad_y_large)
+        thick_band_large = bgr[yy0_large:yy1_large, :].copy()
+        candidates.append(thick_band_large)
+        
+        # Deduplicate candidates
+        uniq_candidates: List[np.ndarray] = []
+        seen_keys = set()
+        for roi in candidates:
+            if roi.size == 0:
+                continue
+            Hc, Wc = roi.shape[:2]
+            key = (Hc, Wc, tuple(roi[Hc // 2, Wc // 2].tolist()))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                uniq_candidates.append(roi)
+        
+        # Try decoding each candidate with full processing
+        for roi in uniq_candidates:
+            text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True)
+            if text:
+                return text
 
-    # Deduplicate candidates by shape + central pixel
-    uniq_candidates: List[np.ndarray] = []
-    seen_keys = set()
-    for roi in candidates:
-        if roi.size == 0:
-            continue
-        Hc, Wc = roi.shape[:2]
-        key = (Hc, Wc, tuple(roi[Hc // 2, Wc // 2].tolist()))
-        if key not in seen_keys:
-            seen_keys.add(key)
-            uniq_candidates.append(roi)
+    # ========== Phase 2: Secondary bands ==========
+    for y0_frac, y1_frac in SECONDARY_BANDS:
+        band = _extract_band(bgr, y0_frac, y1_frac)
+        if band.size > 0:
+            # Try full band and blobs with full processing
+            candidates = [band]
+            candidates.extend(_split_into_barcode_blobs(band))
+            
+            for roi in candidates:
+                if roi.size == 0:
+                    continue
+                text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True)
+                if text:
+                    return text
 
-    # 3) Try decoding each candidate
-    for roi in uniq_candidates:
-        text = _decode_roi(roi)
-        if text:
-            return text
+    # ========== Phase 3: Full image fallback (reduced processing) ==========
+    # Use fewer scales/rotations and faster preprocessing to maintain speed
+    text = _decode_roi(bgr, SCALE_FACTORS_FULLIMG, ROTATION_ANGLES_FULLIMG, thorough=False)
+    if text:
+        return text
 
     raise ValueError("No decodable barcode found.")
 
