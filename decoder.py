@@ -13,7 +13,6 @@ Improvements:
 - Full-image fallback with priority search
 - Maintains high reliability with broader coverage
 - URL support for remote images
-- Early exit optimization when long barcode found
 
 Usage:
     python read_barcode.py /path/to/image.jpg
@@ -49,7 +48,7 @@ from PIL import Image
 
 # Primary search band (fraction of full height) where barcode is most likely
 # Adjusted to cover both upper label area and middle band
-PRIMARY_Y0_FRAC = 0.12
+PRIMARY_Y0_FRAC = 0.08
 PRIMARY_Y1_FRAC = 0.42
 
 # Secondary search bands to check before full-image fallback
@@ -68,11 +67,11 @@ MIN_ROI_HEIGHT = 200
 MIN_ROI_WIDTH = 800
 MAX_ROI_LONG_SIDE = 2200
 
-# Scale factors to try
-SCALE_FACTORS = [1.0, 1.5, 2.0, 0.75, 2.5]
+# Scale factors to try (reduced from 5 to 3 for speed)
+SCALE_FACTORS = [1.0, 1.5, 2.0]
 
-# Small rotation angles to try (degrees)
-ROTATION_ANGLES = [0, -2, 2, -5, 5, -1, 1, -3, 3]
+# Small rotation angles to try (reduced from 9 to 5 for speed)
+ROTATION_ANGLES = [0, -2, 2, -3, 3]
 
 # For full-image fallback: use fewer variants to maintain speed
 SCALE_FACTORS_FULLIMG = [1.0, 1.5, 2.0]
@@ -94,7 +93,14 @@ def _decode_with_pyzbar(gray: np.ndarray) -> List[str]:
     # Restrict to common linear symbologies; NO DataBar.
     SYMBOLS = [
         ZBarSymbol.CODE128,
+        ZBarSymbol.CODE39,
+        ZBarSymbol.CODE93,
         ZBarSymbol.I25,
+        ZBarSymbol.EAN13,
+        ZBarSymbol.EAN8,
+        ZBarSymbol.UPCA,
+        ZBarSymbol.UPCE,
+        ZBarSymbol.CODABAR,
     ]
 
     pil_img = Image.fromarray(gray)
@@ -472,12 +478,8 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
     """
     Read the single barcode embedded in a slab image.
     
-    Args:
-        image_path: Local file path or HTTP(S) URL to the image
-        debug: Enable debug output
-    
     Strategy:
-    1. Search primary band (8-42%) with full processing
+    1. Search primary band (20-42%) with full processing
     2. Search secondary bands with full processing
     3. Fall back to full image with reduced processing
     
@@ -487,53 +489,13 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
         FileNotFoundError
         ValueError if the image cannot be read or no barcode is decodable.
     """
-    if debug:
-        print(f"[DEBUG] image_path type: {type(image_path)}", file=sys.stderr)
-        print(f"[DEBUG] image_path value: '{image_path}'", file=sys.stderr)
-    
-    # Handle URLs
-    if image_path.startswith(('http://', 'https://')):
-        tmp_path = None
-        try:
-            if debug:
-                print(f"[DEBUG] Downloading from URL: {image_path}", file=sys.stderr)
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-                tmp_path = tmp.name
-            
-            urllib.request.urlretrieve(image_path, tmp_path)
-            
-            if debug:
-                print(f"[DEBUG] Download complete, reading image...", file=sys.stderr)
-            
-            bgr = cv2.imread(tmp_path)
-            
-            if bgr is None:
-                raise ValueError(f"Could not read downloaded image from URL: {image_path}")
-            
-            if debug:
-                print(f"[DEBUG] Image loaded: {bgr.shape}", file=sys.stderr)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to process URL {image_path}: {type(e).__name__}: {e}")
-        finally:
-            # Clean up temp file
-            if tmp_path:
-                try:
-                    Path(tmp_path).unlink()
-                except Exception:
-                    pass
-    else:
-        if debug:
-            print(f"[DEBUG] Treating as local file path", file=sys.stderr)
-        # Handle local files
-        p = Path(image_path)
-        if not p.exists():
-            raise FileNotFoundError(image_path)
+    p = Path(image_path)
+    if not p.exists():
+        raise FileNotFoundError(image_path)
 
-        bgr = cv2.imread(str(p))
-        if bgr is None:
-            raise ValueError(f"Could not read image: {image_path}")
+    bgr = cv2.imread(str(p))
+    if bgr is None:
+        raise ValueError(f"Could not read image: {image_path}")
 
     H = bgr.shape[0]
 
@@ -542,20 +504,13 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
     if band.size > 0:
         candidates: List[np.ndarray] = []
         
-        # Full band
+        # Start with just the full band - often sufficient
         candidates.append(band)
         
-        # Morphology-based blobs
-        candidates.extend(_split_into_barcode_blobs(band))
+        # Try morphology-based blobs only if needed
+        candidates.extend(_split_into_barcode_blobs(band)[:2])  # Limit to top 2 blobs
         
-        # Slightly thicker band
-        pad_y = int(H * 0.03)
-        yy0 = max(0, int(H * PRIMARY_Y0_FRAC) - pad_y)
-        yy1 = min(H, int(H * PRIMARY_Y1_FRAC) + pad_y)
-        thick_band = bgr[yy0:yy1, :].copy()
-        candidates.append(thick_band)
-        
-        # Even thicker band
+        # Add ONE thicker band variant instead of two
         pad_y_large = int(H * 0.05)
         yy0_large = max(0, int(H * PRIMARY_Y0_FRAC) - pad_y_large)
         yy1_large = min(H, int(H * PRIMARY_Y1_FRAC) + pad_y_large)
@@ -574,14 +529,19 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
                 seen_keys.add(key)
                 uniq_candidates.append(roi)
         
-        # Collect ALL barcodes from all candidates, then pick best
+        # Try candidates in order and collect results
         all_phase1_hits: List[str] = []
         for roi in uniq_candidates:
             text = _decode_roi(roi, SCALE_FACTORS, ROTATION_ANGLES, thorough=True, debug=debug)
             if text:
                 all_phase1_hits.append(text)
+                # Early exit if we found a long barcode (13+ chars)
+                if len(text) >= 13:
+                    if debug:
+                        print(f"[DEBUG] Phase 1 found long barcode, returning: {text}", file=sys.stderr)
+                    return text
         
-        # Choose the best barcode from all Phase 1 results
+        # If we have any hits (even short ones), return the best
         if all_phase1_hits:
             if debug:
                 print(f"[DEBUG] Phase 1 all hits: {all_phase1_hits}", file=sys.stderr)
@@ -619,6 +579,8 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
 
 
 def main() -> int:
+    print("[DEBUG] Script version: 2.0-URL-SUPPORT", file=sys.stderr)
+    
     ap = argparse.ArgumentParser(
         description="Read the single barcode in an image and print its text."
     )
@@ -626,12 +588,18 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
     args = ap.parse_args()
     
+    if args.debug:
+        print(f"[DEBUG] Starting with image: {args.image}", file=sys.stderr)
+        print(f"[DEBUG] About to call read_single_barcode()", file=sys.stderr)
+    
     try:
         text = read_single_barcode(args.image, debug=args.debug)
         print(text)
         return 0
     except FileNotFoundError as e:
+        import traceback
         sys.stderr.write(f"Error: File not found: {e}\n")
+        traceback.print_exc(file=sys.stderr)
         return 1
     except ValueError as e:
         sys.stderr.write(f"Error: {e}\n")
