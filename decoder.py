@@ -49,7 +49,7 @@ from PIL import Image
 
 # Primary search band (fraction of full height) where barcode is most likely
 # Adjusted to cover both upper label area and middle band
-PRIMARY_Y0_FRAC = 0.18
+PRIMARY_Y0_FRAC = 0.12
 PRIMARY_Y1_FRAC = 0.42
 
 # Secondary search bands to check before full-image fallback
@@ -61,7 +61,7 @@ SECONDARY_BANDS = [
 ]
 
 # Minimum length we consider a "real" barcode (ignore junk like "1").
-MIN_BARCODE_LEN = 12
+MIN_BARCODE_LEN = 8
 
 # Target minimum ROI size before decoding.
 MIN_ROI_HEIGHT = 200
