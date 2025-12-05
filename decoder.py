@@ -398,6 +398,10 @@ def _try_decode_single_roi(bgr: np.ndarray, thorough: bool = True, debug: bool =
             if debug:
                 print(f"[DEBUG] pyzbar found: {hits}", file=sys.stderr)
             all_hits.extend(hits)
+            
+            # Early exit if we found a long barcode (13+ chars = likely the real one)
+            if any(len(h.strip()) >= 13 for h in hits):
+                break
 
     return all_hits
 
@@ -406,6 +410,7 @@ def _try_with_rotation(bgr: np.ndarray, angles: List[int], thorough: bool = True
     """
     Try decoding with small rotation angles.
     Returns ALL barcodes found across all angles.
+    Early exits if a long barcode (13+ chars) is found.
     """
     H, W = bgr.shape[:2]
     center = (W // 2, H // 2)
@@ -422,6 +427,10 @@ def _try_with_rotation(bgr: np.ndarray, angles: List[int], thorough: bool = True
         hits = _try_decode_single_roi(rotated, thorough=thorough, debug=debug)
         if hits:
             all_hits.extend(hits)
+            
+            # Early exit if we found a long barcode
+            if any(len(h.strip()) >= 13 for h in hits):
+                break
 
     return all_hits
 
@@ -430,6 +439,7 @@ def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thoroug
     """
     Try to decode a single ROI with multiple scales and rotations.
     Collects ALL barcodes and returns the best one.
+    Early exits once a long barcode (13+ chars) is found.
     
     Args:
         bgr: BGR image ROI
@@ -452,6 +462,10 @@ def _decode_roi(bgr: np.ndarray, scales: List[float], angles: List[int], thoroug
         hits = _try_with_rotation(scaled, angles, thorough=thorough, debug=debug)
         if hits:
             all_hits.extend(hits)
+            
+            # Early exit if we found a long barcode
+            if any(len(h.strip()) >= 13 for h in hits):
+                break
 
     # Return the best barcode from all attempts
     return _best_barcode(all_hits)
@@ -464,12 +478,8 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
     """
     Read the single barcode embedded in a slab image.
     
-    Args:
-        image_path: Local file path or HTTP(S) URL to the image
-        debug: Enable debug output
-    
     Strategy:
-    1. Search primary band (8-42%) with full processing
+    1. Search primary band (20-42%) with full processing
     2. Search secondary bands with full processing
     3. Fall back to full image with reduced processing
     
@@ -479,62 +489,13 @@ def read_single_barcode(image_path: str, debug: bool = False) -> str:
         FileNotFoundError
         ValueError if the image cannot be read or no barcode is decodable.
     """
-    # ALWAYS print this to verify function is being called
-    print(f"[DEBUG ENTRY] Function called with: '{image_path}'", file=sys.stderr)
-    print(f"[DEBUG ENTRY] First 10 chars as bytes: {image_path[:10].encode()}", file=sys.stderr)
-    print(f"[DEBUG ENTRY] Checking startswith: {image_path.startswith(('http://', 'https://'))}", file=sys.stderr)
-    
-    if debug:
-        print(f"[DEBUG] image_path type: {type(image_path)}", file=sys.stderr)
-        print(f"[DEBUG] image_path value: '{image_path}'", file=sys.stderr)
-        print(f"[DEBUG] Starts with http?: {image_path.startswith(('http://', 'https://'))}", file=sys.stderr)
-    
-    # Handle URLs
-    if image_path.startswith(('http://', 'https://')):
-        tmp_path = None
-        try:
-            if debug:
-                print(f"[DEBUG] Downloading from URL: {image_path}", file=sys.stderr)
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-                tmp_path = tmp.name
-            
-            if debug:
-                print(f"[DEBUG] Saving to temp file: {tmp_path}", file=sys.stderr)
-            
-            urllib.request.urlretrieve(image_path, tmp_path)
-            
-            if debug:
-                print(f"[DEBUG] Download complete, reading image...", file=sys.stderr)
-            
-            bgr = cv2.imread(tmp_path)
-            
-            if bgr is None:
-                raise ValueError(f"Could not read downloaded image from URL: {image_path}")
-            
-            if debug:
-                print(f"[DEBUG] Image loaded: {bgr.shape}", file=sys.stderr)
-                
-        except Exception as e:
-            raise ValueError(f"Failed to process URL {image_path}: {type(e).__name__}: {e}")
-        finally:
-            # Clean up temp file
-            if tmp_path:
-                try:
-                    Path(tmp_path).unlink()
-                except Exception:
-                    pass
-    else:
-        if debug:
-            print(f"[DEBUG] Treating as local file path", file=sys.stderr)
-        # Handle local files
-        p = Path(image_path)
-        if not p.exists():
-            raise FileNotFoundError(image_path)
+    p = Path(image_path)
+    if not p.exists():
+        raise FileNotFoundError(image_path)
 
-        bgr = cv2.imread(str(p))
-        if bgr is None:
-            raise ValueError(f"Could not read image: {image_path}")
+    bgr = cv2.imread(str(p))
+    if bgr is None:
+        raise ValueError(f"Could not read image: {image_path}")
 
     H = bgr.shape[0]
 
