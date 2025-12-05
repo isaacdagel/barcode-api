@@ -49,7 +49,7 @@ from PIL import Image
 
 # Primary search band (fraction of full height) where barcode is most likely
 # Adjusted to cover both upper label area and middle band
-PRIMARY_Y0_FRAC = 0.08
+PRIMARY_Y0_FRAC = 0.18
 PRIMARY_Y1_FRAC = 0.42
 
 # Secondary search bands to check before full-image fallback
@@ -61,7 +61,7 @@ SECONDARY_BANDS = [
 ]
 
 # Minimum length we consider a "real" barcode (ignore junk like "1").
-MIN_BARCODE_LEN = 8
+MIN_BARCODE_LEN = 12
 
 # Target minimum ROI size before decoding.
 MIN_ROI_HEIGHT = 200
@@ -94,14 +94,7 @@ def _decode_with_pyzbar(gray: np.ndarray) -> List[str]:
     # Restrict to common linear symbologies; NO DataBar.
     SYMBOLS = [
         ZBarSymbol.CODE128,
-        ZBarSymbol.CODE39,
-        ZBarSymbol.CODE93,
         ZBarSymbol.I25,
-        ZBarSymbol.EAN13,
-        ZBarSymbol.EAN8,
-        ZBarSymbol.UPCA,
-        ZBarSymbol.UPCE,
-        ZBarSymbol.CODABAR,
     ]
 
     pil_img = Image.fromarray(gray)
